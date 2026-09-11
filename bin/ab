@@ -196,6 +196,8 @@ def cmd_board(_args):
 
     print(c("\n  СЛОТЫ  (experiment_1/2/3 — каналы данных в Plausible)", BOLD))
     for key, pl in CFG["platforms"].items():
+        if (pl.get("product") or all_products()[0]) not in my_products():
+            continue
         cells = []
         for slot in SLOTS:
             n = slot.split("_")[1]

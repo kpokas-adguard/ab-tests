@@ -664,7 +664,7 @@ body{padding:20px 14px}.rhead{flex-direction:column;gap:4px}}
 """
     doc = f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>A/B-тесты AdGuard</title><style>{css}</style></head><body><div class="wrap">
+<title>A/B-тесты · {e(" + ".join(CFG.get("product_map", {}).get(p, {}).get("name", p) for p in my_products()))}</title><style>{css}</style></head><body><div class="wrap">
 <h1>A/B-тесты · {e(" + ".join(CFG.get("product_map", {}).get(p, {}).get("name", p) for p in my_products()))}</h1>
 <div class="upd">Слоты — по живым данным Plausible за 30 дней, собраны {TODAY.isoformat()}<br>{freshness_html()}</div>
 <div class="stats">{sum_html}</div>
