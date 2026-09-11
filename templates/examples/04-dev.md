@@ -1,6 +1,6 @@
 Проект: AG · Тип: Задача · Компоненты: Android: AdGuard
 Исправить в версиях: Android: AdGuard v4.15 · Метки: Split-Testing
-Assignee: Kseniia Pokas
+Assignee: <PM, config.local.yml → pm.name>
 
 ЗАГОЛОВОК
 Implement new screen of main screen for A/B test — «Basic level on main screen»

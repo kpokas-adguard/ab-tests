@@ -1,5 +1,5 @@
 Проект: AG · Тип: Design · Компоненты: Android: AdGuard · Метки: Split-Testing
-Assignee: Kseniia Pokas
+Assignee: <PM, config.local.yml → pm.name>
 
 ЗАГОЛОВОК
 Уровень защиты на главном экране [A/B тест]
@@ -33,7 +33,7 @@ Assignee: Kseniia Pokas
 
 ## К кому обратиться
 
-Kseniia Pokas
+<PM, автор задачи>
 
 ## Кого позвать на ревью
 

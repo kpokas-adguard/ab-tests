@@ -1,5 +1,5 @@
 Проект: ADG · Тип: Задача · Компоненты: BackendJava · Приоритет: P2: High
-Assignee: Kseniia Pokas
+Assignee: <PM, config.local.yml → pm.name>
 
 ЗАГОЛОВОК
 Add information about Test AG-57632 to the service

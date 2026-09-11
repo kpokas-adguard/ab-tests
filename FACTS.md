@@ -65,7 +65,7 @@ username. ID не меняются — записать один раз, дал�
 
 | Пользователь | username | Роль |
 | ------------ | -------- | ---- |
-| Kseniia Pokas | k.pokas | PM |
+| _PM_ | `config.local.yml → pm.jira_username` | PM |
 | Anna Khimchenko | _не проверено_ | дизайн |
 | Alexey Gorbatko | _не проверено_ | бэк |
 
@@ -242,7 +242,7 @@ Purpose `Confirmatory` · Platform и Research Area — по тесту.
   полные списки select/multi_select, Type/Product/Platform/Research Area —
   multi_select, Purpose — Generative/Confirmatory, Jira — url, Notion
   release — url, 📅 Release — relation + ID базы релизов, user id
-  Kseniia Pokas); заполнены ID компонентов AG
+  PM); заполнены ID компонентов AG
 - 2026-09-11 — Plausible: `90d` не поддерживается (использовать 6mo);
   Jira: `issuelinks` не принимается API, связь руками; состояние слотов
   macmini на дату

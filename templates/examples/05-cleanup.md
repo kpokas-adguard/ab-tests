@@ -1,5 +1,5 @@
 Проект: AG · Тип: Задача · Компоненты: Android: AdGuard
-Метки: Split-Testing, cleanup · Assignee: Kseniia Pokas
+Метки: Split-Testing, cleanup · Assignee: <PM, config.local.yml → pm.name>
 Заводится ВМЕСТЕ с dev-задачей, версия проставляется после решения.
 
 ЗАГОЛОВОК

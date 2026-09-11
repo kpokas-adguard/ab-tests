@@ -1,5 +1,5 @@
 Проект: AG · Тип: Product · Компоненты: Product: AdBlocker · Приоритет: P2: High
-Assignee: Kseniia Pokas · Due Date: +5 дней
+Assignee: <PM, config.local.yml → pm.name> · Due Date: +5 дней
 Создаётся воркфлоу подготовки, если разведка нашла проблемы в разметке.
 
 ЗАГОЛОВОК
