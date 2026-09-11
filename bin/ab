@@ -443,7 +443,7 @@ def cmd_fix(args):
                 print(f"  · {g}")
     if not shown:
         print(c("\n  Всё закрыто.", GRN))
-    print(c("\n  Не знаешь значение — спроси агента: /ab-recheck <ключ>\n", DIM))
+    print(c("\n  Не знаешь значение — спроси агента: «проверь <ключ>»\n", DIM))
 
 
 OWNERS = CFG.get("field_owners") or {}
