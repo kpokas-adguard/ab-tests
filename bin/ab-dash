@@ -53,19 +53,25 @@ def api(path, params):
 
 
 def product_of(t):
-    """Продукт теста: явное поле → платформа → VPN в названии → adblocker."""
+    """Продукт теста: явное поле → платформа → имя продукта в заголовке → первый в product_map."""
     if t.get("product"):
         return str(t["product"]).lower()
     plat = (CFG.get("platforms") or {}).get(t.get("platform") or "", {})
     if plat.get("product"):
         return plat["product"]
-    if "vpn" in str(t.get("title", "")).lower():
-        return "vpn"
-    return "adblocker"
+    title = str(t.get("title", "")).lower()
+    for prod in all_products():                 # имя продукта в заголовке
+        if prod in title:
+            return prod
+    return all_products()[0]
+
+
+def all_products():
+    return list((CFG.get("product_map") or {}).keys()) or ["default"]
 
 
 def my_products():
-    return [str(p).lower() for p in (CFG.get("products") or ["adblocker"])]
+    return [str(p).lower() for p in (CFG.get("products") or all_products())]
 
 
 def load_tests():
@@ -376,10 +382,11 @@ def registry_html():
     rows = registry_rows()
     if not rows:
         return ('<div class="muted">Библиотека пуста. Заполнить: <code>/ab-sync</code> '
-                'в чате — она соберёт все тесты из бэк-задач ADG, включая VPN.</div>')
+                'в чате — она соберёт все тесты всех продуктов из бэк-задач ADG.</div>')
     states = ["идёт", "закрывается", "закрыт", "не зарегистрирован"]
     cnt = {st: sum(1 for r in rows if r["state"] == st) for st in states}
-    vpn = sum(1 for r in rows if "vpn" in r["product"].lower())
+    mine = my_products()
+    other = sum(1 for r in rows if not any(p in r["product"].lower() for p in mine))
     chips = "".join(
         f'<button class="rf" data-st="{e(st)}">{e(st)} <b>{cnt[st]}</b></button>'
         for st in states if cnt[st])
@@ -387,14 +394,14 @@ def registry_html():
     tone = {"идёт": "live", "закрывается": "debt", "закрыт": "done", "не зарегистрирован": "prep"}
     body = ""
     for r in rows:
-        prod_cls = "vpn" if "vpn" in r["product"].lower() else ""
+        prod_cls = "" if any(p in r["product"].lower() for p in mine) else "other"
         body += (f'<tr data-st="{e(r["state"])}" class="{prod_cls}">'
                  f'<td><code>{e(r["name"])}</code></td>'
                  f'<td>{e(r["product"])}</td><td>{e(r["platform"])}</td>'
                  f'<td class="muted">{e(r["reg"])}</td><td class="muted">{e(r["close"])}</td>'
                  f'<td><span class="stage {tone.get(r["state"], "")}">{e(r["state"])}</span></td></tr>')
     return (f'<div class="rfilters">{chips}</div>'
-            f'<div class="muted" style="margin:6px 0 10px">Все продукты, включая VPN ({vpn}). '
+            f'<div class="muted" style="margin:6px 0 10px">Все продукты — чужих {other}, приглушены. '
             f'Источник — бэк-задачи ADG: регистрация и закрытие.</div>'
             f'<table class="compact reg"><thead><tr><th>experiment_name</th><th>Продукт</th>'
             f'<th>Платформа</th><th>Регистрация</th><th>Закрытие</th><th>На бэке</th></tr></thead>'
@@ -411,7 +418,7 @@ def build():
     live = [t for t in tests if t.get("stage") != "closed"]
     done = [t for t in tests if t.get("stage") == "closed"]
     mine = my_products()
-    plats = [p for p, v in CFG["platforms"].items() if (v.get("product") or "adblocker") in mine]
+    plats = [p for p, v in CFG["platforms"].items() if (v.get("product") or all_products()[0]) in mine]
     slot_data = {p: slot_live(p) for p in plats}
 
     # платформа показывается, если есть данные в слотах или есть тесты в трекере
@@ -624,7 +631,7 @@ color:var(--mut);border:1px solid var(--line);cursor:pointer}
 .rf b{color:var(--fg);margin-left:3px}
 .rf.on{border-color:var(--busy);color:var(--fg)}
 .stage.done{color:var(--free)}.stage.prep{color:var(--dim)}
-table.reg tr.vpn td{opacity:.6}
+table.reg tr.other td{opacity:.6}
 table.reg code{font-size:11.5px}
 .iss{display:block;font-size:11.5px;color:var(--soon)}
 .iss.crit{color:var(--dirty);font-weight:600}

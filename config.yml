@@ -30,12 +30,12 @@ product_map:
     notion_product: ЗАПОЛНИ              # значение Product в Research Board
 
 platforms:
-  extension: {name: Extension, cadence: continuous, extra_approver: "Артём (обяз. для расширения)", component: "Extensions: AdGuard"}
-  windows:  {name: Windows, cadence: monthly,    extra_approver: null}
-  macos:    {name: macOS,   cadence: monthly,    extra_approver: null}
-  ios:      {name: iOS,     cadence: store,      extra_approver: null}
-  android:  {name: Android, cadence: store,      extra_approver: null}
-  macmini:  {name: Mac Mini, cadence: 6w,        extra_approver: null, component: "Mac: AdGuard Mini"}  # цикл ~1.5 месяца
+  extension: {name: Extension, cadence: continuous, extra_approver: "Артём (обяз. для расширения)", component: "Extensions: AdGuard", product: adblocker}
+  windows:  {name: Windows, cadence: monthly,    extra_approver: null, product: adblocker}
+  macos:    {name: macOS,   cadence: monthly,    extra_approver: null, product: adblocker}
+  ios:      {name: iOS,     cadence: store,      extra_approver: null, product: adblocker}
+  android:  {name: Android, cadence: store,      extra_approver: null, product: adblocker}
+  macmini:  {name: Mac Mini, cadence: 6w,        extra_approver: null, component: "Mac: AdGuard Mini", product: adblocker}  # цикл ~1.5 месяца
   # VPN — свои платформы: другие компоненты, другие площадки Plausible
   vpn_windows:   {name: VPN Windows,   cadence: monthly,    extra_approver: null, component: "Windows: VPN",    product: vpn}
   vpn_macos:     {name: VPN macOS,     cadence: monthly,    extra_approver: null, component: "Mac: VPN",        product: vpn}

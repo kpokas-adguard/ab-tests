@@ -219,7 +219,7 @@ Jira и Notion описывают **замысел**. Plausible показыва
 ~/ab-tests/bin/ab-plausible goal <test-id> <событие>   конверсия по вариантам
 ```
 
-Платформы: `extension`, `macos`, `android`, `macmini`, `windows`, `ios`.
+Платформы — ключи `config.yml → platforms`, только твоих продуктов.
 
 ### Как читать вывод
 

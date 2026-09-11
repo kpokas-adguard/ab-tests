@@ -34,7 +34,7 @@ GATES = {
              ("hypothesis", "гипотеза"), ("primary_metric", "основная метрика"),
              ("segment", "сегмент: кого и где проверяем"),
              ("no_diff_choice", "что берём, если разницы нет: дефолт или новый"),
-             ("web_approved_by_artem", "согласование с Артёмом (обязательно для расширения)", "web_only")],
+             ("extra_approved", "доп. согласование (config → platforms.*.extra_approver)", "extra_approver")],
     "design_sync": [("branches_agreed", "единая трактовка веток с дизайном")],
     "feasibility": [("feasibility", "ответ лида платформы: да/нет/с условиями")],
     "scheduling": [("current_conversion", "текущая конверсия"),
@@ -101,19 +101,25 @@ def as_date(v):
 
 
 def product_of(t):
-    """Продукт теста: явное поле → платформа → VPN в названии → adblocker."""
+    """Продукт теста: явное поле → платформа → имя продукта в заголовке → первый в product_map."""
     if t.get("product"):
         return str(t["product"]).lower()
     plat = (CFG.get("platforms") or {}).get(t.get("platform") or "", {})
     if plat.get("product"):
         return plat["product"]
-    if "vpn" in str(t.get("title", "")).lower():
-        return "vpn"
-    return "adblocker"
+    title = str(t.get("title", "")).lower()
+    for prod in all_products():                 # имя продукта в заголовке
+        if prod in title:
+            return prod
+    return all_products()[0]
+
+
+def all_products():
+    return list((CFG.get("product_map") or {}).keys()) or ["default"]
 
 
 def my_products():
-    return [str(p).lower() for p in (CFG.get("products") or ["adblocker"])]
+    return [str(p).lower() for p in (CFG.get("products") or all_products())]
 
 
 def load_tests():
@@ -145,7 +151,7 @@ def missing(t, stage=None):
     for rule in GATES.get(stage, []):
         field, label = rule[0], rule[1]
         cond = rule[2] if len(rule) > 2 else None
-        if cond == "web_only" and t.get("platform") != "extension":
+        if cond == "extra_approver" and not (CFG.get("platforms") or {}).get(t.get("platform") or "", {}).get("extra_approver"):
             continue
         v = get(t, field)
         if v is None or v == "" or v == [] or v is False:
@@ -556,7 +562,7 @@ def cmd_doctor(args):
         add("products", True, "Продукты", ", ".join(pmap.get(p, {}).get("name", p) for p in prods))
     else:
         add("products", False, "Продукты", "config.local.yml → products: пусто",
-            "агент Setup спросит: VPN, AdBlocker или все")
+            "агент Setup спросит, с каким продуктом работаешь")
 
     # ── 4. product_map заполнен для выбранных ──
     for p in prods:
@@ -583,7 +589,7 @@ def cmd_doctor(args):
     sites = (CFG.get("plausible") or {}).get("site_ids") or {}
     plats = CFG.get("platforms") or {}
     for p in prods:
-        my_plats = [k for k, v in plats.items() if (v.get("product") or "adblocker") == p]
+        my_plats = [k for k, v in plats.items() if (v.get("product") or all_products()[0]) == p]
         known = [k for k in my_plats if sites.get(k) and str(sites[k]) != "ЗАПОЛНИ"]
         missing_ = [k for k in my_plats if k not in known]
         name = pmap.get(p, {}).get("name", p)

@@ -21,8 +21,9 @@
 
 Дата: 2026-09-11
 Было: компонент `Product`
-Верно: компонент **`Product: AdBlocker`** — всегда, для всех продуктовых задач,
-которые заводит PM. Не `Product`.
+Верно: компонент продуктовых задач — из `config.yml →
+product_map.<продукт>.jira_product_component` (для AdBlocker это
+`Product: AdBlocker`). Не голый `Product`.
 
 
 ## Верхняя граница baseline — не из конверсии следующего шага

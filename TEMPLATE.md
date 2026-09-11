@@ -21,7 +21,7 @@ secondary_metric:
 segment:               # кого и где проверяем
 extrapolation:         # на кого экстраполируем результат
 no_diff_choice:        # если разницы нет — берём "дефолт" или "новый"
-web_approved_by_artem: # только для web
+extra_approved:        # только если у платформы есть extra_approver в config.yml
 
 # ═══ Шаг 2 — Дизайн-синк ═══
 design_sync_at:
