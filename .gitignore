@@ -1,0 +1,9 @@
+# личное — у каждого своё
+config.local.yml
+# собирается локально
+dashboard.html
+*.bak
+__pycache__/
+.DS_Store
+# внутренние черновики
+archive/

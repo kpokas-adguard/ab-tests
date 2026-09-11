@@ -1,0 +1,17 @@
+#!/bin/bash
+# Собирает чистую копию папки для передачи другому продакту.
+# Личное (секция pm, дашборд, архив) вычищается; тесты и библиотека имён — общие, остаются.
+set -e
+SRC="$HOME/ab-tests"
+OUT="${1:-$HOME/Desktop/ab-tests-$(date +%Y-%m-%d).zip}"
+TMP="$(mktemp -d)/ab-tests"
+
+rsync -a "$SRC/" "$TMP/" \
+  --exclude .DS_Store --exclude dashboard.html --exclude archive --exclude proposal \
+  --exclude '*.bak' --exclude '__pycache__' --exclude config.local.yml
+
+
+rm -f "$OUT"; (cd "$(dirname "$TMP")" && zip -qr "$OUT" ab-tests)
+rm -rf "$(dirname "$TMP")"
+echo "Готово: $OUT ($(du -h "$OUT" | cut -f1))"
+echo "Личное (config.local.yml) не включено; без dashboard.html, archive/, proposal/. Токен Plausible в архив не попадает."

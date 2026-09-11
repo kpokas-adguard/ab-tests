@@ -1,0 +1,53 @@
+<!doctype html><html><head><meta charset="utf-8">
+<title>Жизненный цикл A/B-теста</title>
+<style>body{margin:0;padding:32px;font-family:-apple-system,sans-serif;background:#fff;color:#111}
+h2{font-size:15px;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin:32px 0 12px}
+.mermaid{max-width:1300px}</style></head><body><h2>Фазы и владельцы</h2><pre class="mermaid">flowchart LR
+    classDef product fill:#e8f0fe,stroke:#2563eb,color:#1e3a8a
+    classDef project fill:#fef3e2,stroke:#d97706,color:#78350f
+    classDef done fill:#ecfdf5,stroke:#059669,color:#064e3b
+
+    F1["<b>① Подготовка</b><br/><i>продукт</i><br/><br/>гипотеза, воронка,<br/>слот, карточка"]:::product
+    F2["<b>② Доставка</b><br/><i>проджект</i><br/><br/>эпик и задачи<br/>из карточки"]:::project
+    F3["<b>③ Предрелиз</b><br/><i>продукт</i><br/><br/>проверка за QA"]:::product
+    F4["<b>④ Прод</b><br/><i>продукт</i><br/><br/>наблюдение,<br/>решение"]:::product
+    F5["<b>⑤ Закрытие</b><br/><i>продукт</i><br/><br/>бэк, выпиливание,<br/>макеты"]:::product
+    D(["✓ готово"]):::done
+
+    F1 -- "карточка полная<br/>и однозначная" --> F2
+    F2 -- "все задачи<br/>по шаблону" --> F3
+    F3 -- "можно<br/>выпускать" --> F4
+    F4 -- "решение<br/>принято" --> F5
+    F5 -- "всё закрыто,<br/>слот чист" --> D
+</pre><h2>Семь задач в одном эпике</h2><pre class="mermaid">flowchart TB
+    classDef epic fill:#111,stroke:#111,color:#fff
+    classDef vN fill:#f3f4f6,stroke:#9ca3af,color:#111
+    classDef vN1 fill:#fce7f3,stroke:#db2777,color:#831843
+    classDef pre fill:#e8f0fe,stroke:#2563eb,color:#1e3a8a
+
+    T1["1 · Продуктовая: проработка<br/>до эпика"]:::pre
+    E["Эпик теста"]:::epic
+    T1 --> E
+
+    subgraph N["версия N — внедрение"]
+        direction LR
+        T2["2 · Дизайн"]:::vN
+        T3["3 · Бэк: регистрация"]:::vN
+        T4["4 · Разработка"]:::vN
+    end
+
+    subgraph N1["версия N+1 — закрытие"]
+        direction LR
+        T5["5 · Выпиливание"]:::vN1
+        T6["6 · Бэк: закрытие"]:::vN1
+        T7["7 · Макеты<br/>если победил B"]:::vN1
+    end
+
+    E --> N
+    E --> N1
+</pre>
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({startOnLoad:true,theme:'base',htmlLabels:true,
+flowchart:{curve:'basis',nodeSpacing:50,rankSpacing:60,padding:14}});
+</script></body></html>

@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""ab-plausible — данные A/B-теста из Plausible Stats API v1.
+
+  ab-plausible slots <платформа>           все три слота платформы в проде
+  ab-plausible slot <test-id>              кто шлёт в слот (детект загрязнения)
+  ab-plausible goal <test-id> <event>      конверсия по вариантам
+  ab-plausible check                       проверить доступ к API
+"""
+import sys, json, os, ssl, datetime, urllib.parse, urllib.request, urllib.error
+from pathlib import Path
+import yaml
+
+ROOT = Path(__file__).resolve().parent.parent
+CFG = yaml.safe_load((ROOT / "config.yml").read_text(encoding="utf-8"))
+_local = ROOT / "config.local.yml"          # личное: pm, products — не в git
+if _local.exists():
+    for k, v in (yaml.safe_load(_local.read_text(encoding="utf-8")) or {}).items():
+        if isinstance(v, dict) and isinstance(CFG.get(k), dict): CFG[k].update(v)
+        else: CFG[k] = v
+PL = CFG.get("plausible") or {}
+TODAY = datetime.date.today()
+
+USE_COLOR = sys.stdout.isatty()
+def c(s, code): return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+RED, YEL, GRN, DIM, BOLD = "31", "33", "32", "2", "1"
+
+
+def die(msg):
+    print(c(msg, RED)); sys.exit(1)
+
+
+def token():
+    f = Path(os.path.expanduser(PL.get("key_file") or "~/.plausible-key"))
+    if not f.exists():
+        die(f"Нет файла с токеном: {f}\n"
+            f"Создай:  echo 'ТОКЕН' > {f} && chmod 600 {f}")
+    t = f.read_text(encoding="utf-8").strip()
+    if not t:
+        die(f"Файл {f} пустой")
+    return t
+
+
+def base_url():
+    b = (PL.get("base_url") or "").strip().rstrip("/")
+    if not b or b == "ЗАПОЛНИ":
+        die("Не задан plausible.base_url в config.yml")
+    return b
+
+
+def site_id(platform):
+    s = (PL.get("site_ids") or {}).get(platform)
+    if not s or s == "ЗАПОЛНИ":
+        die(f"Не задан site_id для платформы '{platform}' в config.yml")
+    return s
+
+
+def ssl_ctx():
+    """Корни для TLS.
+
+    Сборки Python с python.org на macOS не видят системное хранилище
+    (ssl.get_default_verify_paths().cafile == None), поэтому берём certifi.
+    Дополнительно грузим корпоративный CA, если он задан в config.ca_file.
+    """
+    ctx = ssl.create_default_context()
+    if not ssl.get_default_verify_paths().cafile:
+        try:
+            import certifi
+            ctx.load_verify_locations(cafile=certifi.where())
+        except Exception:
+            die("Python не видит корневые сертификаты, и certifi недоступен.\n"
+                "Поставь его:  python3 -m pip install --user certifi")
+    ca = PL.get("ca_file")
+    if ca:
+        f = Path(os.path.expanduser(ca))
+        if not f.is_absolute():
+            f = ROOT / ca
+        if f.exists():
+            ctx.load_verify_locations(cafile=str(f))
+    return ctx
+
+
+def api(path, params):
+    url = f"{base_url()}/api/v1/stats/{path}?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token()}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx()) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            die("Plausible ответил 403 — доступ с этого IP запрещён.\n"
+                "Скорее всего, выключен VPN. Включи и повтори.")
+        if e.code == 401:
+            die("Plausible ответил 401 — токен не принят. Проверь ~/.plausible-key")
+        body = e.read().decode("utf-8", "replace")[:300]
+        die(f"HTTP {e.code} от Plausible\n{body}")
+    except urllib.error.URLError as e:
+        die(f"Не достучался до {base_url()}: {e.reason}\n"
+            f"Проверь base_url и доступ к внутренней сети (VPN?).")
+
+
+def load_test(tid):
+    f = ROOT / "tests" / f"{tid}.md"
+    if not f.exists():
+        die(f"Нет теста {tid}. Список: ab board")
+    raw = f.read_text(encoding="utf-8")
+    return yaml.safe_load(raw.split("---", 2)[1]) or {}
+
+
+def period_of(t):
+    """Период теста: от старта до остановки, иначе последние 30 дней."""
+    s = t.get("started_at")
+    if not s:
+        return {"period": "30d"}
+    s = s.isoformat() if hasattr(s, "isoformat") else str(s)
+    e = t.get("stopped_at") or TODAY
+    e = e.isoformat() if hasattr(e, "isoformat") else str(e)
+    return {"period": "custom", "date": f"{s},{e}"}
+
+
+def require(t, *fields):
+    miss = [f for f in fields if not t.get(f)]
+    if miss:
+        die(f"В карточке теста не заполнено: {', '.join(miss)}")
+
+
+def cmd_slot(args):
+    if not args: die("ab-plausible slot <test-id>")
+    t = load_test(args[0])
+    require(t, "platform", "slot", "experiment_name")
+    slot, exp = t["slot"], t["experiment_name"]
+    p = {"site_id": site_id(t["platform"]),
+         "property": f"event:props:{slot}",
+         "metrics": "visitors,events", "limit": 100}
+    p.update(period_of(t))
+    res = api("breakdown", p).get("results", [])
+
+    print(c(f"\n  СЛОТ {slot} · {t['platform']} · {p['site_id']}", BOLD))
+    print(c(f"  период: {p.get('date', p.get('period'))}\n", DIM))
+    if not res:
+        print(c("  Данных нет. Тест ещё не идёт, разметка не долетает "
+                "или неверный site_id.", YEL)); return
+
+    def val(r): return str(r.get(slot, "") or "")
+    def vis(r): return r.get("visitors") or 0
+
+    # (none) — события без этого свойства, т.е. пользователи вне эксперимента.
+    # Это норма, а не загрязнение.
+    outside = [r for r in res if val(r) in ("(none)", "", "none")]
+    inside = [r for r in res if r not in outside]
+    ours = [r for r in inside if val(r).startswith(exp)]
+    alien = [r for r in inside if r not in ours]
+    part = sum(vis(r) for r in inside)
+
+    if not inside:
+        print(c("  В слот никто не пишет — эксперимент ещё не в проде.", DIM))
+        print(f"  Вне эксперимента: {sum(vis(r) for r in outside):,} визитов".replace(",", " "))
+        print(c(f"\n  ✓ Слот {slot} свободен и чист — можно занимать.", GRN) + "\n")
+        return
+
+    print(f"  {'значение':<48}{'visitors':>10}{'events':>9}{'доля':>8}")
+    for r in ours + alien:
+        share = f"{vis(r) / part * 100:4.1f}%" if part else "  — "
+        line = f"  {val(r):<48}{vis(r):>10}{r.get('events') or 0:>9}{share:>8}"
+        print(line if r in ours else c(line + "  ← ЧУЖОЕ", RED))
+    for r in outside:
+        print(c(f"  {'(вне эксперимента)':<48}{vis(r):>10}{r.get('events') or 0:>9}"
+                f"{'':>8}", DIM))
+
+    if alien:
+        print(c(f"\n  ⚠ ЗАГРЯЗНЕНИЕ: в слоте {slot} есть значения не от {exp}.", RED + ";1"))
+        print(c("  Это хвост предыдущего теста, он искажает твою статистику.", RED))
+        print(c(f"  Затронуто: {sum(vis(r) for r in alien)} из {part} участников", RED))
+    else:
+        print(c(f"\n  ✓ Слот чистый: только значения {exp}", GRN))
+    print()
+
+
+def cmd_goal(args):
+    if len(args) < 2: die("ab-plausible goal <test-id> <имя-события>")
+    tid, goal = args[0], " ".join(args[1:])
+    t = load_test(tid)
+    require(t, "platform", "slot", "experiment_name", "variants")
+    slot, sid = t["slot"], site_id(t["platform"])
+    per = period_of(t)
+
+    print(c(f"\n  ЦЕЛЬ «{goal}» · {t['experiment_name']} · {slot}", BOLD))
+    print(c(f"  период: {per.get('date', per.get('period'))}\n", DIM))
+    print(f"  {'вариант':<40}{'всего':>9}{'цель':>9}{'CR':>9}{'к контролю':>13}")
+
+    base_cr, rows = None, []
+    for suffix in t["variants"]:
+        vn = f"{t['experiment_name']}-{suffix}"
+        f_base = f"event:props:{slot}=={vn}"
+        pa = {"site_id": sid, "metrics": "visitors", "filters": f_base}; pa.update(per)
+        total = (api("aggregate", pa).get("results", {}).get("visitors") or {}).get("value") or 0
+        pg = {"site_id": sid, "metrics": "visitors",
+              "filters": f"{f_base};event:goal=={goal}"}; pg.update(per)
+        conv = (api("aggregate", pg).get("results", {}).get("visitors") or {}).get("value") or 0
+        cr = conv / total * 100 if total else 0.0
+        if base_cr is None and suffix.startswith("a"):
+            base_cr = cr
+        rows.append((suffix, vn, total, conv, cr))
+
+    for suffix, vn, total, conv, cr in rows:
+        if base_cr and not suffix.startswith("a"):
+            d = (cr - base_cr) / base_cr * 100
+            delta = c(f"{d:+.1f}%", GRN if d > 0 else RED)
+        else:
+            delta = c("контроль", DIM) if suffix.startswith("a") else "—"
+        print(f"  {suffix + ' · ' + vn:<40}{total:>9}{conv:>9}{cr:>8.2f}%{delta:>13}")
+
+    need = t.get("sample_size_per_variation")
+    if need:
+        low = [s for s, _, tot, _, _ in rows if tot < int(need)]
+        print()
+        if low:
+            print(c(f"  ⚠ Выборка не набрана (нужно {need} на вариант): {', '.join(low)}", YEL))
+        else:
+            print(c(f"  ✓ Выборка набрана: ≥{need} на каждый вариант", GRN))
+    print(c("\n  Значимость считай отдельно — здесь только сырые цифры.", DIM))
+    print()
+
+
+def cmd_slots(args):
+    """Обзор всех слотов платформы по живым данным Plausible."""
+    if not args: die("ab-plausible slots <платформа>")
+    plat = args[0]
+    sid = site_id(plat)
+    print(c(f"\n  СЛОТЫ В ПРОДЕ · {plat} · {sid}  (30 дней)\n", BOLD))
+    for slot in CFG["slots"]:
+        p = {"site_id": sid, "property": f"event:props:{slot}",
+             "metrics": "visitors", "period": "30d", "limit": 100}
+        res = api("breakdown", p).get("results", [])
+        inside = [r for r in res
+                  if str(r.get(slot, "") or "") not in ("(none)", "", "none")]
+        if not inside:
+            print(f"  {slot:<14}{c('свободен', GRN)}")
+            continue
+        part = sum(r.get("visitors") or 0 for r in inside)
+        names = sorted({str(r.get(slot)).rsplit("-", 1)[0] for r in inside})
+        mark = c("занят", YEL) if len(names) == 1 else c("НЕСКОЛЬКО ЭКСПЕРИМЕНТОВ", RED + ";1")
+        print(f"  {slot:<14}{mark}  {', '.join(names)}  ({part} участников)")
+        for r in sorted(inside, key=lambda x: -(x.get("visitors") or 0)):
+            print(c(f"    └ {str(r.get(slot)):<46}{r.get('visitors') or 0:>10}", DIM))
+    print()
+
+
+def cmd_check(_a):
+    sid = next((v for v in (PL.get("site_ids") or {}).values()
+                if v and v != "ЗАПОЛНИ"), None)
+    if not sid: die("В config.yml не заполнен ни один site_id")
+    r = api("aggregate", {"site_id": sid, "period": "7d", "metrics": "visitors"})
+    v = (r.get("results", {}).get("visitors") or {}).get("value")
+    print(c(f"\n  ✓ Связь есть. {sid}: {v} visitors за 7 дней\n", GRN))
+
+
+CMDS = {"slot": cmd_slot, "slots": cmd_slots, "goal": cmd_goal, "check": cmd_check}
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd not in CMDS:
+        print(__doc__); sys.exit(1)
+    CMDS[cmd](sys.argv[2:])

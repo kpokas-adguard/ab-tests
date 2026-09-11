@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+"""ab-dash — HTML-дашборд A/B-тестов: слоты, стадии, дедлайны, ссылки.
+
+  ab-dash            собрать и открыть в браузере
+  ab-dash --no-open  только собрать
+"""
+import re, sys, json, os, ssl, datetime, urllib.parse, urllib.request, urllib.error, html, subprocess
+from pathlib import Path
+import yaml
+
+ROOT = Path(__file__).resolve().parent.parent
+CFG = yaml.safe_load((ROOT / "config.yml").read_text(encoding="utf-8"))
+_local = ROOT / "config.local.yml"          # личное: pm, products — не в git
+if _local.exists():
+    for k, v in (yaml.safe_load(_local.read_text(encoding="utf-8")) or {}).items():
+        if isinstance(v, dict) and isinstance(CFG.get(k), dict): CFG[k].update(v)
+        else: CFG[k] = v
+PL = CFG.get("plausible") or {}
+SLOTS = CFG["slots"]
+TODAY = datetime.date.today()
+OUT = ROOT / "dashboard.html"
+
+STAGE_RU = {"incoming": "Входящая", "card": "Карточка", "design_sync": "Дизайн-синк",
+            "feasibility": "Реализуемость", "scheduling": "Планирование",
+            "development": "Разработка", "qa": "QA", "running": "Идёт",
+            "analysis": "Анализ", "rollout": "Выкат/откат",
+            "closing": "Закрытие хвоста", "closed": "Закрыт"}
+LIVE = {"running", "analysis", "rollout"}
+DEBT = {"closing"}
+
+
+def ssl_ctx():
+    ctx = ssl.create_default_context()
+    if not ssl.get_default_verify_paths().cafile:
+        try:
+            import certifi; ctx.load_verify_locations(cafile=certifi.where())
+        except Exception: pass
+    return ctx
+
+
+def api(path, params):
+    b = (PL.get("base_url") or "").rstrip("/")
+    f = Path(os.path.expanduser(PL.get("key_file") or "~/.plausible-key"))
+    if not b or b == "ЗАПОЛНИ" or not f.exists():
+        return None
+    url = f"{b}/api/v1/stats/{path}?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {f.read_text().strip()}"})
+    try:
+        with urllib.request.urlopen(req, timeout=25, context=ssl_ctx()) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def product_of(t):
+    """Продукт теста: явное поле → платформа → VPN в названии → adblocker."""
+    if t.get("product"):
+        return str(t["product"]).lower()
+    plat = (CFG.get("platforms") or {}).get(t.get("platform") or "", {})
+    if plat.get("product"):
+        return plat["product"]
+    if "vpn" in str(t.get("title", "")).lower():
+        return "vpn"
+    return "adblocker"
+
+
+def my_products():
+    return [str(p).lower() for p in (CFG.get("products") or ["adblocker"])]
+
+
+def load_tests():
+    out = []
+    for p in sorted((ROOT / "tests").glob("*.md")):
+        raw = p.read_text(encoding="utf-8")
+        if not raw.startswith("---"): continue
+        try: d = yaml.safe_load(raw.split("---", 2)[1]) or {}
+        except yaml.YAMLError: continue
+        d.setdefault("id", p.stem); d.setdefault("stage", "incoming")
+        if product_of(d) not in my_products():
+            continue  # не мой продукт
+        out.append(d)
+    return out
+
+
+def slot_live(platform):
+    """Что реально летит в слоты платформы. -> {slot: [(value, visitors)]}"""
+    sid = (PL.get("site_ids") or {}).get(platform)
+    if not sid or sid == "ЗАПОЛНИ": return None
+    res = {}
+    for slot in SLOTS:
+        r = api("breakdown", {"site_id": sid, "property": f"event:props:{slot}",
+                              "metrics": "visitors", "period": "30d", "limit": 50})
+        if r is None: return None
+        rows = [(str(x.get(slot) or ""), x.get("visitors") or 0) for x in r.get("results", [])]
+        res[slot] = [(v, n) for v, n in rows if v not in ("(none)", "", "none")]
+    return res
+
+
+def as_date(v):
+    if isinstance(v, datetime.date): return v
+    if isinstance(v, str):
+        try: return datetime.date.fromisoformat(v.strip())
+        except ValueError: return None
+    return None
+
+
+def deadlines(t):
+    out = []
+    for field, label in (("code_freeze", "код-фриз"), ("planned_stop", "остановка")):
+        d = as_date(t.get(field))
+        if d: out.append((d, label, (d - TODAY).days))
+    da = as_date(t.get("decision_at"))
+    if da and not t.get("code_removed_released_at"):
+        due = da + datetime.timedelta(days=CFG["warn_before_days"]["cleanup"])
+        out.append((due, "выпилить", (due - TODAY).days))
+    return out
+
+
+def e(x): return html.escape(str(x if x is not None else ""))
+
+
+def links_of(t):
+    out = []
+    tasks = t.get("tasks") or {}
+    labels = [("design", "дизайн"), ("dev", "разработка"), ("backend", "бэк"),
+              ("backend_close", "закрытие"), ("cleanup", "выпиливание")]
+    for k, lab in labels:
+        v = tasks.get(k)
+        if v:
+            out.append(f'<a class="chip link" href="https://jira.int.agrd.dev/browse/{e(v)}">'
+                       f'<i>{lab}</i>{e(v)}</a>')
+    if t.get("research_card"):
+        out.append(f'<a class="chip link nb" href="{e(t["research_card"])}">Notion</a>')
+    return "".join(out) or '<span class="chip empty">задач нет</span>'
+
+
+STAGES = CFG["stages"]
+
+
+def stage_ge(t, name):
+    """Стадия теста не раньше указанной."""
+    try:
+        return STAGES.index(t.get("stage", "incoming")) >= STAGES.index(name)
+    except ValueError:
+        return False
+
+
+def issues(t):
+    """Что недоделано. -> [(критично?, текст)]"""
+    out, tasks = [], (t.get("tasks") or {})
+    st = t.get("stage", "incoming")
+
+    # ── закрытый тест: важно одно — выпилен ли код ──
+    if st == "closed":
+        if not tasks.get("backend_close"):
+            out.append((True, "нет задачи на закрытие теста на бэке"))
+        elif not t.get("backend_finished_at"):
+            out.append((False, "не записана дата закрытия на бэке"))
+        if not t.get("code_removed_version"):
+            out.append((True, "код не выпилен из клиента"))
+        return out
+
+    if stage_ge(t, "development"):
+        if not tasks.get("backend"):
+            out.append((True, "нет бэк-задачи — тест не посчитается"))
+        if not t.get("experiment_name"):
+            out.append((True, "не задан experiment_name"))
+    if stage_ge(t, "scheduling") and not t.get("slot"):
+        out.append((True, "не назначен слот"))
+
+    # ── хвост: решение принято, кода нет ──
+    if st in DEBT or (as_date(t.get("decision_at")) and st != "closed"):
+        if not tasks.get("backend_close"):
+            out.append((True, "нет бэк-задачи на закрытие теста"))
+        elif not t.get("backend_finished_at"):
+            out.append((False, "не записана дата закрытия на бэке"))
+        if not t.get("code_removed_version"):
+            out.append((True, "код не выпилен — слот остаётся грязным"))
+
+    if stage_ge(t, "development"):
+        if not tasks.get("cleanup"):
+            out.append((False, "нет задачи на выпиливание"))
+        if not tasks.get("design"):
+            out.append((False, "нет дизайн-задачи"))
+    if not t.get("research_card"):
+        out.append((False, "нет карточки в Research Board"))
+    # выборку считают до запуска; после старта напоминать поздно
+    if st in ("scheduling", "development") and not t.get("sample_size_per_variation"):
+        out.append((False, "не посчитана выборка"))
+    return out
+
+
+def issues_html(t):
+    it = issues(t)
+    if not it:
+        return '<span class="ok">всё на месте</span>'
+    return "".join(f'<span class="iss {"crit" if c else ""}">{e(txt)}</span>'
+                   for c, txt in it)
+
+
+EXAMPLES = [
+    ("Продуктовая: проработка теста", "01-product.md", "появилась гипотеза · тип Product"),
+    ("Дизайн", "02-design.md", "планирование релиза · тип Design"),
+    ("Бэк: регистрация теста", "03-backend-register.md", "планирование релиза · проект ADG"),
+    ("Разработка", "04-dev.md", "планирование релиза · проект AG"),
+    ("Выпиливание из клиента", "05-cleanup.md", "создаётся с dev-задачей, версия — после решения"),
+    ("Бэк: закрытие теста", "06-backend-close.md", "решение по тесту · проект ADG"),
+    ("Дизайн: обновление макетов", "07-design-update.md", "решение по тесту · только если победил B"),
+    ("Телеметрия: правки по итогам разведки", "08-telemetry-fixes.md", "подготовка · если нашлись проблемы в разметке"),
+]
+
+
+def md_lite(text):
+    """Минимальный markdown -> HTML: заголовки, списки, таблицы, код, жирный."""
+    out, rows, lst = [], [], False
+
+    def flush_table():
+        nonlocal rows
+        if not rows: return
+        head, body = rows[0], [r for r in rows[1:] if not set(r.replace("|", "").strip()) <= set("-: ")]
+        th = "".join(f"<th>{inline(c)}</th>" for c in head.strip("|").split("|"))
+        tb = "".join("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in r.strip("|").split("|")) + "</tr>"
+                     for r in body)
+        out.append(f'<table class="rules"><thead><tr>{th}</tr></thead><tbody>{tb}</tbody></table>')
+        rows = []
+
+    def inline(x):
+        x = e(x.strip())
+        x = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", x)
+        x = re.sub(r"`(.+?)`", r"<code>\1</code>", x)
+        x = re.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"<em>\1</em>", x)
+        return x
+
+    for line in text.splitlines():
+        st = line.strip()
+        if st.startswith("|"):
+            if lst: out.append("</ul>"); lst = False
+            rows.append(st); continue
+        flush_table()
+        if not st:
+            if lst: out.append("</ul>"); lst = False
+            continue
+        if st.startswith("# "):
+            continue
+        if st.startswith("## "):
+            if lst: out.append("</ul>"); lst = False
+            out.append(f"<h4>{inline(st[3:])}</h4>"); continue
+        if st.startswith("- "):
+            if not lst: out.append("<ul>"); lst = True
+            out.append(f"<li>{inline(st[2:])}</li>"); continue
+        if lst: out.append("</ul>"); lst = False
+        out.append(f"<p>{inline(st)}</p>")
+    if lst: out.append("</ul>")
+    flush_table()
+    return "".join(out)
+
+
+def rules_html():
+    f = ROOT / "RULES.md"
+    return md_lite(f.read_text(encoding="utf-8")) if f.exists() else ""
+
+
+def examples_html():
+    out = ""
+    for title, fname, note in EXAMPLES:
+        f = ROOT / "templates" / "examples" / fname
+        if not f.exists(): continue
+        out += (f'<details><summary>{e(title)} <span class="muted">— {e(note)}</span></summary>'
+                f'<pre>{e(f.read_text(encoding="utf-8"))}</pre></details>')
+    return out
+
+
+SCRIPT = """<script>
+(function(){
+  const stats=[...document.querySelectorAll('.stat')];
+  const rows=[...document.querySelectorAll('.row')];
+  const slots=[...document.querySelectorAll('.slot')];
+  const plats=[...document.querySelectorAll('.plat')];
+  const secT=document.getElementById('s-tests');
+  const secS=document.getElementById('s-slots');
+  const secH=document.getElementById('s-history');
+  const cnt=document.getElementById('cnt');
+  const reset=document.getElementById('reset');
+  const empty=document.getElementById('empty');
+  let cur=null;
+
+  const has=(el,f)=>(el.dataset.f||'').split(' ').includes(f);
+
+  function apply(f){
+    cur = (f===cur||f==='all') ? null : f;
+    stats.forEach(b=>b.classList.toggle('on', !!cur && b.dataset.f===cur));
+    reset.hidden = !cur;
+
+    if(cur==='history'){
+      secH.scrollIntoView({behavior:'smooth',block:'start'});
+      cur=null; stats.forEach(b=>b.classList.remove('on')); reset.hidden=true;
+      return;
+    }
+    const slotMode = cur==='dirty';
+    secT.hidden = slotMode;
+    secS.hidden = !!cur && !slotMode;
+
+    slots.forEach(s=>{ s.hidden = slotMode && !has(s,'dirty'); });
+    plats.forEach(p=>{
+      const vis=[...p.querySelectorAll('.slot')].some(s=>!s.hidden);
+      p.hidden = slotMode && !vis;
+    });
+
+    let n=0;
+    rows.forEach(r=>{ const ok = !cur || has(r,cur); r.hidden=!ok; if(ok) n++; });
+    cnt.textContent = cur ? n : rows.length;
+    empty.hidden = !(cur && n===0);
+    if(cur && !slotMode) secT.scrollIntoView({behavior:'smooth',block:'start'});
+  }
+
+  stats.forEach(b=>b.addEventListener('click',()=>apply(b.dataset.f)));
+
+  const rfs=[...document.querySelectorAll('.rf')];
+  const rrows=[...document.querySelectorAll('table.reg tbody tr')];
+  rfs.forEach(b=>b.addEventListener('click',()=>{
+    const st=b.dataset.st, on=b.classList.contains('on');
+    rfs.forEach(x=>x.classList.remove('on'));
+    if(on||st==='all'){ rrows.forEach(r=>r.hidden=false); return; }
+    b.classList.add('on');
+    rrows.forEach(r=>{ r.hidden = r.dataset.st!==st; });
+  }));
+  reset.addEventListener('click',()=>apply('all'));
+})();
+</script>"""
+
+
+def data_age():
+    """Сколько дней назад последний раз менялись карточки тестов."""
+    files = list((ROOT / "tests").glob("*.md"))
+    if not files:
+        return None
+    newest = max(f.stat().st_mtime for f in files)
+    return (datetime.date.today() - datetime.date.fromtimestamp(newest)).days
+
+
+def freshness_html():
+    d = data_age()
+    if d is None:
+        return ""
+    if d == 0:
+        return '<span class="fresh ok">данные о тестах обновлены сегодня</span>'
+    word = "день" if d == 1 else ("дня" if d < 5 else "дней")
+    txt = f"данные о тестах обновлялись {d} {word} назад"
+    if d >= 7:
+        return (f'<span class="fresh stale">{txt} — пора запустить '
+                f'<code>/ab-sync</code></span>')
+    return f'<span class="fresh">{txt}</span>'
+
+
+def registry_rows():
+    """Строки таблицы из NAMES-REGISTRY.md -> [dict]."""
+    f = ROOT / "NAMES-REGISTRY.md"
+    if not f.exists():
+        return []
+    rows, seen_header = [], False
+    for line in f.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if cells and cells[0] == "experiment_name":
+            seen_header = True; continue
+        if not seen_header or set(cells[0]) <= set("-: "):
+            continue
+        if len(cells) < 6:
+            continue
+        rows.append(dict(zip(("name", "product", "platform", "reg", "close", "state"), cells)))
+    return rows
+
+
+def registry_html():
+    rows = registry_rows()
+    if not rows:
+        return ('<div class="muted">Библиотека пуста. Заполнить: <code>/ab-sync</code> '
+                'в чате — она соберёт все тесты из бэк-задач ADG, включая VPN.</div>')
+    states = ["идёт", "закрывается", "закрыт", "не зарегистрирован"]
+    cnt = {st: sum(1 for r in rows if r["state"] == st) for st in states}
+    vpn = sum(1 for r in rows if "vpn" in r["product"].lower())
+    chips = "".join(
+        f'<button class="rf" data-st="{e(st)}">{e(st)} <b>{cnt[st]}</b></button>'
+        for st in states if cnt[st])
+    chips += f'<button class="rf" data-st="all">все <b>{len(rows)}</b></button>'
+    tone = {"идёт": "live", "закрывается": "debt", "закрыт": "done", "не зарегистрирован": "prep"}
+    body = ""
+    for r in rows:
+        prod_cls = "vpn" if "vpn" in r["product"].lower() else ""
+        body += (f'<tr data-st="{e(r["state"])}" class="{prod_cls}">'
+                 f'<td><code>{e(r["name"])}</code></td>'
+                 f'<td>{e(r["product"])}</td><td>{e(r["platform"])}</td>'
+                 f'<td class="muted">{e(r["reg"])}</td><td class="muted">{e(r["close"])}</td>'
+                 f'<td><span class="stage {tone.get(r["state"], "")}">{e(r["state"])}</span></td></tr>')
+    return (f'<div class="rfilters">{chips}</div>'
+            f'<div class="muted" style="margin:6px 0 10px">Все продукты, включая VPN ({vpn}). '
+            f'Источник — бэк-задачи ADG: регистрация и закрытие.</div>'
+            f'<table class="compact reg"><thead><tr><th>experiment_name</th><th>Продукт</th>'
+            f'<th>Платформа</th><th>Регистрация</th><th>Закрытие</th><th>На бэке</th></tr></thead>'
+            f'<tbody>{body}</tbody></table>')
+
+
+def decision_ru(d):
+    return {"ship": "выкатили", "rollback": "откатили",
+            "inconclusive": "без эффекта"}.get(str(d or "").lower(), d or "—")
+
+
+def build():
+    tests = load_tests()
+    live = [t for t in tests if t.get("stage") != "closed"]
+    done = [t for t in tests if t.get("stage") == "closed"]
+    mine = my_products()
+    plats = [p for p, v in CFG["platforms"].items() if (v.get("product") or "adblocker") in mine]
+    slot_data = {p: slot_live(p) for p in plats}
+
+    # платформа показывается, если есть данные в слотах или есть тесты в трекере
+    def has_activity(p):
+        d = slot_data.get(p)
+        return bool(d) and any(d.get(s) for s in SLOTS)
+    shown = [p for p in plats if has_activity(p)]
+    hidden = [CFG["platforms"][p]["name"] for p in plats if p not in shown]
+
+    dirty_n = 0
+    slot_html = ""
+    for p in shown:
+        name = CFG["platforms"][p]["name"]
+        data = slot_data.get(p)
+        cells = ""
+        for slot in SLOTS:
+            planned = [t for t in live if t.get("platform") == p and t.get("slot") == slot]
+            if data is None:
+                cells += f'<div class="slot unknown" data-f="unknown"><b>{slot}</b><span>нет данных</span></div>'
+                continue
+            rows = data.get(slot, [])
+            if not rows:
+                mark, body = "free", "<span>свободен</span>"
+            else:
+                exps = sorted({v.rsplit("-", 1)[0] for v, _ in rows})
+                total = sum(n for _, n in rows)
+                mark = "dirty" if len(exps) > 1 else "busy"
+                if len(exps) > 1: dirty_n += 1
+                body = "".join(f"<span>{e(x)}</span>" for x in exps)
+                body += f'<span class="muted">{total:,} участников</span>'.replace(",", " ")
+                if len(exps) > 1:
+                    body += '<span class="warn">хвост искажает данные</span>'
+            if planned:
+                body += f'<span class="muted">план: {e(planned[0]["id"])}</span>'
+            cells += f'<div class="slot {mark}" data-f="{mark}"><b>{slot}</b>{body}</div>'
+        slot_html += f'<div class="plat"><h3>{e(name)}</h3><div class="slots">{cells}</div></div>'
+
+    if hidden:
+        slot_html += (f'<div class="muted hid">Скрыты платформы без экспериментов: '
+                      f'{e(", ".join(hidden))}</div>')
+
+    # ── сводка ──
+    over = sum(1 for t in live for _, _, d in deadlines(t) if d < 0)
+    debt = sum(1 for t in live if t.get("stage") in DEBT)
+    crit_n = sum(1 for t in live if any(c for c, _ in issues(t)))
+    cards = [("активных тестов", len(live), "", "all"),
+             ("идут в проде", sum(1 for t in live if t.get("stage") in LIVE), "", "live"),
+             ("грязных слотов", dirty_n, "bad" if dirty_n else "", "dirty"),
+             ("просрочено", over, "bad" if over else "", "over"),
+             ("ждут выпиливания", debt, "warn" if debt else "", "debt"),
+             ("всего проведено", len(done), "", "history")]
+    sum_html = "".join(
+        f'<button class="stat {k}" data-f="{f}"><b>{v}</b><span>{e(l)}</span></button>'
+        for l, v, k, f in cards)
+
+    # ── активные ──
+    rows = ""
+    for t in sorted(live, key=lambda x: list(STAGE_RU).index(x.get("stage", "incoming"))):
+        st = t.get("stage", "incoming")
+        tone = "live" if st in LIVE else ("debt" if st in DEBT else "prep")
+        meta = [e(CFG["platforms"].get(t.get("platform"), {}).get("name", "—"))]
+        if t.get("slot"):
+            meta.append(f'<code>{e(t["slot"])}</code>')
+        meta_html = '<span class="dot">·</span>'.join(meta)
+
+        dl = ""
+        for d, lab, days in sorted(deadlines(t), key=lambda r: r[2]):
+            k = "over" if days < 0 else ("soon" if days <= 7 else "far")
+            txt = f"{lab}: просрочено {-days} дн." if days < 0 else f"{lab}: через {days} дн."
+            dl += f'<span class="chip dl {k}">{e(txt)}</span>'
+
+        probs = "".join(f'<span class="chip {"crit" if c else "warn"}">{e(txt)}</span>'
+                        for c, txt in issues(t))
+        if not probs:
+            probs = '<span class="chip ok">всё на месте</span>'
+
+        flags = [tone]
+        if any(d < 0 for _, _, d in deadlines(t)):
+            flags.append("over")
+        if any(c for c, _ in issues(t)):
+            flags.append("crit")
+        rows += f'''<div class="row {tone}" data-f="{" ".join(flags)}">
+  <div class="rhead">
+    <div><span class="key">{e(t["id"])}</span>
+      <span class="stage {tone}">{e(STAGE_RU.get(st, st))}</span></div>
+    <div class="meta">{meta_html}</div>
+  </div>
+  <div class="rtitle">{e(t.get("title", ""))}</div>
+  <div class="chips">{probs}{dl}</div>
+  <div class="chips links">{links_of(t)}</div>
+</div>'''
+    if not rows:
+        rows = '<div class="muted">Активных тестов нет</div>'
+
+    # ── история ──
+    hist = ""
+    for t in sorted(done, key=lambda x: str(x.get("decision_at") or ""), reverse=True):
+        removed = t.get("code_removed_version")
+        clean = ('<span class="ok">выпилен</span>' if removed
+                 else '<span class="warn">не выпилен</span>')
+        hist += (f'<tr><td><b>{e(t["id"])}</b> <span class="muted">{e(t.get("title",""))}</span></td>'
+                 f'<td>{e(CFG["platforms"].get(t.get("platform"),{}).get("name","—"))}</td>'
+                 f'<td>{e(t.get("slot") or "—")}</td>'
+                 f'<td>{e(decision_ru(t.get("decision")))}</td>'
+                 f'<td>{e(t.get("decision_at") or "—")}</td>'
+                 f'<td>{clean}{" " + e(removed) if removed else ""}</td>'
+                 f'<td class="issues">{issues_html(t)}</td></tr>')
+    hist_html = (f'<table class="compact"><thead><tr><th>Тест</th><th>Платформа</th>'
+                 f'<th>Слот</th><th>Решение</th><th>Дата</th><th>Код</th><th>Что не так</th></tr></thead>'
+                 f'<tbody>{hist}</tbody></table>' if hist else
+                 '<div class="muted">Закрытых тестов в трекере нет. '
+                 'Подтянуть историю: <code>/ab-sync</code> в чате.</div>')
+
+    css = """
+:root{--bg:#fff;--fg:#15171a;--mut:#6b7280;--dim:#9ca3af;--line:#e8eaed;
+--card:#fbfbfc;--free:#059669;--busy:#2563eb;--dirty:#dc2626;--soon:#d97706;
+--critbg:#fef2f2;--warnbg:#fffbeb;--okbg:#ecfdf5;--chip:#f3f4f6}
+@media(prefers-color-scheme:dark){:root{--bg:#0d0f13;--fg:#e8eaed;--mut:#9aa0a6;
+--dim:#6b7280;--line:#23272e;--card:#14171c;--free:#34d399;--busy:#60a5fa;
+--dirty:#f87171;--soon:#fbbf24;--critbg:#2a1416;--warnbg:#2a2213;--okbg:#0f2620;
+--chip:#1c2027}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);-webkit-font-smoothing:antialiased;
+font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:40px 24px}
+.wrap{max-width:1080px;margin:0 auto}
+h1{font-size:26px;letter-spacing:-.02em;margin:0 0 6px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);
+margin:40px 0 14px;font-weight:600}
+h3{font-size:12px;margin:0 0 8px;color:var(--mut);font-weight:600}
+.upd{color:var(--mut);margin-bottom:28px;font-size:13px;line-height:1.8}
+.fresh{font-size:12px;color:var(--dim)}
+.fresh.ok{color:var(--free)}
+.fresh.stale{color:var(--soon);font-weight:600}
+
+/* сводка */
+.stats{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:14px 12px;text-align:center}
+.stat{cursor:pointer;font:inherit;transition:border-color .12s,transform .06s}
+.stat:hover{border-color:var(--dim)}
+.stat:active{transform:scale(.985)}
+.stat.on{border-color:var(--busy);box-shadow:inset 0 0 0 1px var(--busy)}
+#reset{margin-left:10px;font:inherit;font-size:11px;text-transform:none;
+letter-spacing:0;background:var(--chip);color:var(--mut);border:1px solid var(--line);
+border-radius:6px;padding:2px 9px;cursor:pointer}
+#reset:hover{color:var(--fg);border-color:var(--dim)}
+.stat b{display:block;font-size:26px;line-height:1.1;letter-spacing:-.02em}
+.stat span{font-size:11px;color:var(--mut);display:block;margin-top:3px}
+.stat.bad b{color:var(--dirty)}.stat.warn b{color:var(--soon)}
+
+/* слоты */
+.plat{margin-bottom:18px}
+.slots{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.slot{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:12px 14px;display:flex;flex-direction:column;gap:3px;font-size:13px;
+position:relative;overflow:hidden}
+.slot:before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px}
+.slot b{font-size:10px;color:var(--dim);font-weight:600;letter-spacing:.04em;
+text-transform:uppercase;margin-bottom:2px}
+.slot.free:before{background:var(--free)}
+.slot.busy:before{background:var(--busy)}
+.slot.dirty:before{background:var(--dirty)}
+.slot.dirty{background:var(--critbg)}
+.slot.unknown:before{background:var(--line)}
+.warn{color:var(--dirty);font-weight:600;font-size:12px}
+.muted{color:var(--mut);font-size:12px}.hid{margin-top:14px}
+
+/* карточки тестов */
+.rows{display:flex;flex-direction:column;gap:10px}
+.row{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:14px 16px;position:relative;overflow:hidden}
+.row:before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px}
+.row.live:before{background:var(--busy)}
+.row.debt:before{background:var(--soon)}
+.row.prep:before{background:var(--line)}
+.rhead{display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+flex-wrap:wrap}
+.key{font-weight:700;font-size:15px;letter-spacing:-.01em}
+.stage{font-size:11px;padding:2px 8px;border-radius:20px;margin-left:8px;
+background:var(--chip);color:var(--mut);vertical-align:middle}
+.stage.live{color:var(--busy)}.stage.debt{color:var(--soon)}
+.meta{font-size:12px;color:var(--mut);white-space:nowrap}
+.meta .dot{margin:0 6px;color:var(--dim)}
+.meta code{background:var(--chip);padding:1px 6px;border-radius:4px;font-size:11px}
+.rtitle{color:var(--mut);font-size:13px;margin:2px 0 10px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chips.links{margin-top:8px;padding-top:10px;border-top:1px solid var(--line)}
+.chip{font-size:11.5px;padding:3px 9px;border-radius:6px;background:var(--chip);
+color:var(--mut);white-space:nowrap;line-height:1.5}
+.chip.crit{background:var(--critbg);color:var(--dirty);font-weight:600}
+.chip.warn{background:var(--warnbg);color:var(--soon)}
+.chip.ok{background:var(--okbg);color:var(--free)}
+.chip.dl.over{background:var(--critbg);color:var(--dirty);font-weight:600}
+.chip.dl.soon{background:var(--warnbg);color:var(--soon)}
+.chip.empty{opacity:.6}
+a.chip.link{text-decoration:none;color:var(--busy);display:inline-flex;gap:5px}
+a.chip.link i{font-style:normal;color:var(--dim)}
+a.chip.link:hover{background:var(--line)}
+a.chip.link.nb i{display:none}
+
+/* история */
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.06em;
+color:var(--dim);padding:8px;border-bottom:1px solid var(--line);font-weight:600}
+td{padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top;font-size:13px}
+.ok{color:var(--free);font-size:12px}
+.rfilters{display:flex;gap:6px;flex-wrap:wrap}
+.rf{font:inherit;font-size:12px;padding:4px 10px;border-radius:6px;background:var(--chip);
+color:var(--mut);border:1px solid var(--line);cursor:pointer}
+.rf b{color:var(--fg);margin-left:3px}
+.rf.on{border-color:var(--busy);color:var(--fg)}
+.stage.done{color:var(--free)}.stage.prep{color:var(--dim)}
+table.reg tr.vpn td{opacity:.6}
+table.reg code{font-size:11.5px}
+.iss{display:block;font-size:11.5px;color:var(--soon)}
+.iss.crit{color:var(--dirty);font-weight:600}
+.issues{max-width:220px}
+
+/* шаблоны и правила */
+details{background:var(--card);border:1px solid var(--line);border-radius:10px;
+margin-bottom:8px;padding:12px 16px}
+summary{cursor:pointer;font-weight:600;font-size:13px;list-style:none}
+summary::-webkit-details-marker{display:none}
+summary:before{content:"›";display:inline-block;width:14px;color:var(--dim);
+transition:transform .15s}
+details[open] summary:before{transform:rotate(90deg)}
+details pre{margin:14px 0 4px;padding:14px;background:var(--bg);
+border:1px solid var(--line);border-radius:8px;overflow-x:auto;font-size:12px;
+line-height:1.5;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.rules-box{padding:2px 4px 0}
+.rules-det{padding:12px 18px}
+.rules-det summary span{font-weight:400}
+.rules-box h4{font-size:13px;margin:20px 0 6px;color:var(--fg)}
+.rules-box p,.rules-box li{font-size:13px;margin:4px 0;color:var(--mut)}
+.rules-box strong{color:var(--fg)}
+.rules-box ul{margin:4px 0;padding-left:20px}
+table.rules{margin:8px 0 14px}
+table.rules td,table.rules th{padding:6px 8px;font-size:12px}
+code{background:var(--chip);padding:1px 5px;border-radius:4px;font-size:12px;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+@media(max-width:820px){.slots{grid-template-columns:1fr}.stats{grid-template-columns:1fr 1fr}
+body{padding:20px 14px}.rhead{flex-direction:column;gap:4px}}
+"""
+    doc = f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>A/B-тесты AdGuard</title><style>{css}</style></head><body><div class="wrap">
+<h1>A/B-тесты · {e(" + ".join(CFG.get("product_map", {}).get(p, {}).get("name", p) for p in my_products()))}</h1>
+<div class="upd">Слоты — по живым данным Plausible за 30 дней, собраны {TODAY.isoformat()}<br>{freshness_html()}</div>
+<div class="stats">{sum_html}</div>
+<section id="s-tests"><h2>Активные тесты · <span id="cnt">{len(live)}</span><button id="reset" hidden>сбросить фильтр</button></h2>
+<div class="rows">{rows}</div>
+<div id="empty" class="muted" hidden>Под фильтр ничего не подошло</div></section>
+<section id="s-slots"><h2>Слоты</h2>{slot_html}</section>
+<section id="s-history"><h2>Архив завершённых тестов · {len(done)}</h2>{hist_html}</section>
+<section id="s-registry"><h2>Библиотека имён · все продукты</h2>{registry_html()}</section>
+<h2>Как должна выглядеть каждая задача</h2>
+<p class="muted">Заполненные примеры на сквозном тесте AG-57632. Копируются в Jira как есть.</p>
+{examples_html()}
+<h2>Обязательные правила</h2>
+<details class="rules-det"><summary>Что обязательно соблюдать — <span class="muted">запуск, именование, пять задач, карточка, закрытие</span></summary><div class="rules-box">{rules_html()}</div></details>
+</div>{SCRIPT}</body></html>"""
+    OUT.write_text(doc, encoding="utf-8")
+    return len(live), len(done), sum(1 for p in shown if slot_data.get(p) is None)
+
+
+if __name__ == "__main__":
+    n, d, failed = build()
+    print(f"Собрано: {OUT}")
+    print(f"  активных: {n}, в истории: {d}")
+    if failed:
+        print(f"  платформ без данных Plausible: {failed}")
+    if "--no-open" not in sys.argv:
+        subprocess.run(["open", str(OUT)])

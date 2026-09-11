@@ -1,0 +1,800 @@
+#!/usr/bin/env python3
+"""ab — трекер A/B-тестов AdGuard. Команды: board, check, week, new, stages."""
+import sys, datetime
+from pathlib import Path
+import yaml
+
+ROOT = Path(__file__).resolve().parent.parent
+TESTS = ROOT / "tests"
+CFG = yaml.safe_load((ROOT / "config.yml").read_text(encoding="utf-8"))
+_local = ROOT / "config.local.yml"          # личное: pm, products — не в git
+if _local.exists():
+    for k, v in (yaml.safe_load(_local.read_text(encoding="utf-8")) or {}).items():
+        if isinstance(v, dict) and isinstance(CFG.get(k), dict): CFG[k].update(v)
+        else: CFG[k] = v
+TODAY = datetime.date.today()
+
+STAGES = CFG["stages"]
+SLOTS = CFG["slots"]
+STAGE_RU = {
+    "incoming": "0 Incoming", "card": "1 Карточка", "design_sync": "2 Дизайн-синк",
+    "feasibility": "3 Реализуемость", "scheduling": "4 Версия", "development": "5 Разработка",
+    "qa": "6 QA", "running": "7 Идёт", "analysis": "8 Анализ", "rollout": "9 Выкат/откат",
+    "closing": "10 Закрытие хвоста", "closed": "Закрыт",
+}
+# Слот занят с планирования версии и освобождается только после закрытия хвоста
+OCCUPYING = {"scheduling", "development", "qa", "running", "analysis", "rollout", "closing"}
+DEBT = {"rollout", "closing"}
+
+# (поле, что это, [условие])
+GATES = {
+    "incoming": [("scored_by_pm", "скоринг PM"),
+                 ("incoming_comment", "комментарий инициатору о судьбе гипотезы")],
+    "card": [("problem", "проблема"), ("problem_source", "откуда знаем о проблеме"),
+             ("hypothesis", "гипотеза"), ("primary_metric", "основная метрика"),
+             ("segment", "сегмент: кого и где проверяем"),
+             ("no_diff_choice", "что берём, если разницы нет: дефолт или новый"),
+             ("web_approved_by_artem", "согласование с Артёмом (обязательно для расширения)", "web_only")],
+    "design_sync": [("branches_agreed", "единая трактовка веток с дизайном")],
+    "feasibility": [("feasibility", "ответ лида платформы: да/нет/с условиями")],
+    "scheduling": [("current_conversion", "текущая конверсия"),
+                   ("expected_lift", "ожидаемое изменение"),
+                   ("sample_size_per_variation", "выборка per variation"),
+                   ("planned_duration_days", "плановая длительность"),
+                   ("target_release", "целевая версия/патч"),
+                   ("fix_version", "Fix version для Jira"),
+                   ("code_freeze", "дата код-фриза"),
+                   ("slot", "слот experiment_N"),
+                   ("analysts_reviewed_design", "аналитики глянули дизайн эксперимента"),
+                   ("stop_conditions", "условия завершения теста"),
+                   ("worst_case", "переживём ли месяц без возможности отката")],
+    "development": [("experiment_name", "experiment_name (берётся из бэк-задачи)"),
+                    ("variants", "варианты version_name: a_def и b"),
+                    ("telemetry_events", "события телеметрии с pageview"),
+                    ("tasks.design", "дизайн-задача"), ("tasks.dev", "разработческая задача"),
+                    ("tasks.backend", "бэк-задача: регистрация в сервисе A/B"),
+                    ("tasks.cleanup", "задача на выпиливание — заводится СЕЙЧАС"),
+                    ("design_review_done", "продуктовое ревью макетов")],
+    "qa": [("qa_scenarios_sent", "сценарии переданы QA"), ("qa_passed", "QA пройден")],
+    "running": [("release_version", "версия релиза"), ("started_at", "дата старта"),
+                ("planned_stop", "плановая дата остановки"),
+                ("research_team_thread", "тред в research-team"),
+                ("analysts_deadline_in_jira", "аналитики занесли сроки обсчёта в Jira")],
+    "analysis": [("stopped_at", "дата остановки"), ("analyst_reviewed", "перепроверено аналитиком"),
+                 ("results_reviewed_by_analysts", "результаты отправлены аналитикам"),
+                 ("contamination_checked", "проверен хвост предыдущего теста на слоте"),
+                 ("conclusion", "вывод: победитель/нет эффекта/вред")],
+    "rollout": [("decision", "решение"), ("decision_at", "дата решения"),
+                ("cleanup_release", "релиз выпиливания"),
+                ("hypothesis_predicted", "проперти Hypothesis: предсказали или нет")],
+    "closing": [("tasks.backend_close", "задача на закрытие теста на бэке"),
+                ("backend_finished_at", "эксперимент закрыт в A/B-сервисе"),
+                ("code_removed_version", "версия, где код удалён из клиента"),
+                ("code_removed_released_at", "дата релиза этой версии")],
+    "closed": [("communicated_at", "результат разослан и зафиксирован")],
+}
+
+USE_COLOR = sys.stdout.isatty()
+def c(s, code):
+    return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+RED, YEL, GRN, DIM, BOLD, CYN = "31", "33", "32", "2", "1", "36"
+
+
+def get(d, path):
+    cur = d
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def as_date(v):
+    if isinstance(v, datetime.date):
+        return v
+    if isinstance(v, str):
+        try:
+            return datetime.date.fromisoformat(v.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def product_of(t):
+    """Продукт теста: явное поле → платформа → VPN в названии → adblocker."""
+    if t.get("product"):
+        return str(t["product"]).lower()
+    plat = (CFG.get("platforms") or {}).get(t.get("platform") or "", {})
+    if plat.get("product"):
+        return plat["product"]
+    if "vpn" in str(t.get("title", "")).lower():
+        return "vpn"
+    return "adblocker"
+
+
+def my_products():
+    return [str(p).lower() for p in (CFG.get("products") or ["adblocker"])]
+
+
+def load_tests():
+    out = []
+    for p in sorted(TESTS.glob("*.md")):
+        raw = p.read_text(encoding="utf-8")
+        if not raw.startswith("---"):
+            continue
+        try:
+            data = yaml.safe_load(raw.split("---", 2)[1]) or {}
+        except yaml.YAMLError as e:
+            print(c(f"! {p.name}: битый YAML — {e}", RED)); continue
+        data["_file"] = p
+        data.setdefault("id", p.stem)
+        data.setdefault("stage", "incoming")
+        if product_of(data) not in my_products():
+            continue   # не мой продукт — не показываем
+        out.append(data)
+    return out
+
+
+def stage_idx(s):
+    return STAGES.index(s) if s in STAGES else 0
+
+
+def missing(t, stage=None):
+    stage = stage or t.get("stage", "incoming")
+    gaps = []
+    for rule in GATES.get(stage, []):
+        field, label = rule[0], rule[1]
+        cond = rule[2] if len(rule) > 2 else None
+        if cond == "web_only" and t.get("platform") != "extension":
+            continue
+        v = get(t, field)
+        if v is None or v == "" or v == [] or v is False:
+            gaps.append(label)
+    return gaps
+
+
+def deadlines(t):
+    out, idx = [], stage_idx(t.get("stage", "incoming"))
+    cf = as_date(t.get("code_freeze"))
+    if cf and idx < stage_idx("running"):
+        out.append((cf, "код-фриз", (cf - TODAY).days))
+    ps = as_date(t.get("planned_stop"))
+    if ps and idx <= stage_idx("running"):
+        out.append((ps, "плановая остановка", (ps - TODAY).days))
+    da = as_date(t.get("decision_at"))
+    if da and not t.get("code_removed_released_at"):
+        due = da + datetime.timedelta(days=CFG["warn_before_days"]["cleanup"])
+        out.append((due, "закрытие хвоста", (due - TODAY).days))
+    return out
+
+
+def urgency(days):
+    if days < 0:  return c(f"просрочено на {-days} дн.", RED + ";1")
+    if days == 0: return c("сегодня", RED + ";1")
+    if days <= 3: return c(f"через {days} дн.", RED)
+    if days <= 7: return c(f"через {days} дн.", YEL)
+    return c(f"через {days} дн.", DIM)
+
+
+def slot_map(tests):
+    m = {}
+    for t in tests:
+        if t.get("stage") in OCCUPYING and t.get("slot"):
+            m.setdefault((t.get("platform"), t["slot"]), []).append(t)
+    return m
+
+
+def cmd_board(_args):
+    tests = load_tests()
+    sm = slot_map(tests)
+
+    print(c("\n  СЛОТЫ  (experiment_1/2/3 — каналы данных в Plausible)", BOLD))
+    for key, pl in CFG["platforms"].items():
+        cells = []
+        for slot in SLOTS:
+            n = slot.split("_")[1]
+            occ = sm.get((key, slot), [])
+            if not occ:
+                cells.append(c(f"[{n}:свободен]", GRN))
+            elif len(occ) > 1:
+                cells.append(c(f"[{n}:КОЛЛИЗИЯ×{len(occ)}]", RED + ";1"))
+            else:
+                t = occ[0]
+                label = f"{n}:{t['id']}"
+                cells.append(c(f"[{label}·хвост]", YEL) if t.get("stage") in DEBT else f"[{label}]")
+        print(f"  {pl['name']:<9} " + " ".join(cells))
+
+    noslot = [t for t in tests if t.get("stage") in OCCUPYING and not t.get("slot")]
+    if noslot:
+        print(c(f"  ⚠ без слота: {', '.join(t['id'] for t in noslot)}", RED))
+
+    print(c("\n  ТЕСТЫ ПО СТАДИЯМ", BOLD))
+    live = [t for t in tests if t.get("stage") != "closed"]
+    if not live:
+        print(c("  (пусто — ab new <id> <платформа>)", DIM))
+    for stage in STAGES:
+        for t in [x for x in live if x.get("stage") == stage]:
+            plat = CFG["platforms"].get(t.get("platform"), {}).get("name", t.get("platform", "?"))
+            tail = f"{plat}" + (f" · {t['slot']}" if t.get("slot") else "")
+            print(f"  {STAGE_RU.get(stage, stage):<18} {t['id']}  {c(tail, DIM)}")
+            gaps = missing(t)
+            if gaps:
+                shown = ", ".join(gaps[:3]) + (f" и ещё {len(gaps)-3}" if len(gaps) > 3 else "")
+                print(f"      {c('не хватает:', RED)} {shown}")
+            else:
+                nxt = STAGES[min(stage_idx(stage) + 1, len(STAGES) - 1)]
+                print(f"      {c('гейт закрыт → ' + STAGE_RU.get(nxt, nxt), GRN)}")
+
+    rows = sorted(((d, w, n, t) for t in live for d, w, n in deadlines(t)), key=lambda r: r[2])
+    if rows:
+        print(c("\n  ДЕДЛАЙНЫ", BOLD))
+        for d, what, days, t in rows:
+            print(f"  {d.isoformat()}  {t['id']:<22} {what:<20} {urgency(days)}")
+
+    debt = [t for t in live if t.get("stage") in DEBT]
+    if debt:
+        print(c("\n  ХВОСТ — эти тесты держат слоты грязными", BOLD))
+        for t in debt:
+            plat = CFG["platforms"].get(t.get("platform"), {}).get("name", "?")
+            print(f"  {t['id']:<22} {plat:<9} {t.get('slot') or '?':<13} {t.get('decision') or '—'}")
+    print()
+
+
+def cmd_check(args):
+    tests = load_tests()
+    if args:
+        tests = [t for t in tests if t["id"] in args]
+        if not tests:
+            print(c("Тест не найден. Список: ab board", RED)); return 1
+    sm = slot_map(load_tests())
+    for t in tests:
+        stage = t.get("stage", "incoming")
+        print(c(f"\n{t['id']}", BOLD) + f"  — {STAGE_RU.get(stage, stage)}"
+              + (f"  · {t['slot']}" if t.get("slot") else ""))
+        gaps = missing(t)
+        if gaps:
+            print(c(f"  ✗ не закрыто ({len(gaps)}):", RED))
+            for g in gaps:
+                print(f"    · {g}")
+        else:
+            nxt = STAGES[min(stage_idx(stage) + 1, len(STAGES) - 1)]
+            print(c(f"  ✓ гейт закрыт → {STAGE_RU.get(nxt, nxt)}", GRN))
+        if t.get("slot") and stage in OCCUPYING:
+            others = [o for o in sm.get((t.get("platform"), t["slot"]), []) if o["id"] != t["id"]]
+            if others:
+                print(c(f"  ⚠ КОЛЛИЗИЯ слота с: {', '.join(o['id'] for o in others)}", RED + ";1"))
+            if not t.get("slot_checked"):
+                print(c("  ⚠ слот не подтверждён как чистый — хвост прошлого теста исказит данные", YEL))
+        for d, what, days in deadlines(t):
+            print(f"  ⏱ {what}: {d.isoformat()} — {urgency(days)}")
+    print()
+    return 0
+
+
+def cmd_week(_args):
+    tests = [t for t in load_tests() if t.get("stage") != "closed"]
+    print(c(f"\n  СВОДКА НА {TODAY.isoformat()}", BOLD))
+    fires = sorted(((n, t, w) for t in tests for _d, w, n in deadlines(t) if n <= 7),
+                   key=lambda r: r[0])
+    if fires:
+        print(c("\n  ГОРИТ", RED + ";1"))
+        for days, t, what in fires:
+            print(f"  · {t['id']}: {what} {urgency(days)}")
+    coll = [(k, v) for k, v in slot_map(tests).items() if len(v) > 1]
+    if coll:
+        print(c("\n  КОЛЛИЗИИ СЛОТОВ", RED + ";1"))
+        for (plat, slot), ts in coll:
+            print(f"  · {plat} {slot}: {', '.join(t['id'] for t in ts)}")
+    dirty = [t for t in tests if t.get("stage") in OCCUPYING and t.get("slot") and not t.get("slot_checked")]
+    if dirty:
+        print(c("\n  ГРЯЗНЫЕ СЛОТЫ", YEL))
+        for t in dirty:
+            print(f"  · {t['id']} на {t['slot']}: чистота слота не подтверждена")
+    blocked = [(t, g) for t, g in ((x, missing(x)) for x in tests) if g]
+    if blocked:
+        print(c("\n  ЖДЁТ ДЕЙСТВИЯ", YEL))
+        for t, g in blocked:
+            print(f"  · {t['id']} ({STAGE_RU.get(t.get('stage'), '')}): {g[0]}")
+    ready = [t for t in tests if not missing(t)]
+    if ready:
+        print(c("\n  ГОТОВО К ПЕРЕХОДУ", GRN))
+        for t in ready:
+            nxt = STAGES[min(stage_idx(t.get("stage", "incoming")) + 1, len(STAGES) - 1)]
+            print(f"  · {t['id']}: {STAGE_RU.get(t.get('stage'), '')} → {STAGE_RU.get(nxt, nxt)}")
+    if not (fires or coll or dirty or blocked or ready):
+        print(c("\n  Всё тихо.", DIM))
+    print()
+
+
+def cmd_new(args):
+    if len(args) < 2:
+        print(f"Использование: ab new <id> <платформа>\nПлатформы: {', '.join(CFG['platforms'])}")
+        return 1
+    tid, platform = args[0], args[1]
+    if platform not in CFG["platforms"]:
+        print(c(f"Неизвестная платформа: {platform}", RED)); return 1
+    dest = TESTS / f"{tid}.md"
+    if dest.exists():
+        print(c(f"Уже существует: {dest}", RED)); return 1
+    tpl = (ROOT / "TEMPLATE.md").read_text(encoding="utf-8")
+    for a, b in (("__ID__", tid), ("__PLATFORM__", platform), ("__CREATED__", TODAY.isoformat())):
+        tpl = tpl.replace(a, b)
+    dest.write_text(tpl, encoding="utf-8")
+    print(c(f"Создан {dest}", GRN))
+    sm = slot_map(load_tests())
+    free = [s for s in SLOTS if not sm.get((platform, s))]
+    print(f"Свободные слоты на {platform}: " +
+          (c(", ".join(free), GRN) if free else c("нет — сначала закрой хвост одного из идущих", RED)))
+    extra = CFG["platforms"][platform].get("extra_approver")
+    if extra:
+        print(c(f"Не забудь: {extra}", YEL))
+    return 0
+
+
+def _set_in(data, path, value):
+    """Записать значение по пути вида tasks.cleanup."""
+    parts = path.split(".")
+    cur = data
+    for k in parts[:-1]:
+        if not isinstance(cur.get(k), dict):
+            cur[k] = {}
+        cur = cur[k]
+    cur[parts[-1]] = value
+
+
+def _coerce(v):
+    low = v.strip().lower()
+    if low in ("true", "да", "yes", "+"): return True
+    if low in ("false", "нет", "no", "-"): return False
+    if low in ("today", "сегодня"): return TODAY.isoformat()
+    if low in ("null", "none", "пусто", ""): return None
+    return v
+
+
+def cmd_set(args):
+    """ab set <id> <поле> <значение>   или   ab set <id> поле=значение поле=значение ..."""
+    if len(args) < 2:
+        print("ab set <id> <поле> <значение>\n"
+              "ab set <id> поле=значение поле=значение ...   (несколько за раз)\n\n"
+              "  ab set AG-57632 tasks.cleanup AG-57633\n"
+              "  ab set AG-57632 slot=experiment_3 experiment_name=AG-57632-home qa_passed=true\n"
+              "  значения с пробелами — в кавычках: notes=\"текст с пробелами\"")
+        return 1
+    tid = args[0]
+    role = None
+    if "--as" in args:
+        i = args.index("--as"); role = args[i + 1]; args = args[:i] + args[i + 2:]
+    f = TESTS / f"{tid}.md"
+    if not f.exists():
+        print(c(f"Нет теста {tid}", RED)); return 1
+    # два формата: <поле> <значение...>  или  поле=значение ...
+    if len(args) >= 3 and "=" not in args[1]:
+        pairs = [(args[1], " ".join(args[2:]))]
+    else:
+        pairs = []
+        for a in args[1:]:
+            if "=" not in a:
+                print(c(f"Ожидал поле=значение, получил: {a!r}", RED)); return 1
+            k, v = a.split("=", 1); pairs.append((k, v))
+    raw = f.read_text(encoding="utf-8")
+    _, fm, body = raw.split("---", 2)
+    data = yaml.safe_load(fm) or {}
+    if role:
+        bad = [fl for fl, _ in pairs if owner_of(fl) not in (role, "meta", None)]
+        if bad:
+            print(c(f"  отказ: роль «{role}» не владеет полями: {', '.join(bad)}", RED))
+            print(c(f"  владелец: " + ", ".join(f"{b}→{owner_of(b)}" for b in bad), DIM))
+            return 1
+        pairs.append(("synced_at" if role == "jira" else "checked_at", TODAY.isoformat()))
+    print(f"  {tid}:")
+    for field, value in pairs:
+        old_v = get(data, field)
+        _set_in(data, field, _coerce(value))
+        print(f"    {field}: {c(repr(old_v), DIM)} → {c(repr(get(data, field)), GRN)}")
+    f.write_text("---\n" + yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+                 + "---" + body, encoding="utf-8")
+    left = missing(data)
+    print(c(f"  осталось не закрыто: {len(left)}", YEL if left else GRN)
+          + (("  · " + ", ".join(left[:3])) if left else ""))
+    return 0
+
+
+def cmd_fix(args):
+    """Что не закрыто и какой командой чинится."""
+    tests = load_tests()
+    if args:
+        tests = [t for t in tests if t["id"] in args]
+    hints = {
+        "задача на выпиливание": "tasks.cleanup <AG-XXXXX>",
+        "бэк-задача на закрытие теста": "tasks.backend_close <ADG-XXXXX>",
+        "дизайн-задача": "tasks.design <AG-XXXXX>",
+        "бэк-задача: регистрация": "tasks.backend <ADG-XXXXX>",
+        "разработческая задача": "tasks.dev <AG-XXXXX>",
+        "experiment_name": "experiment_name <AG-XXXXX-slug>",
+        "слот experiment_N": "slot experiment_2",
+        "версия, где код удалён": "code_removed_version 4.17",
+        "дата релиза этой версии": "code_removed_released_at today",
+        "закрыт на бэке": "backend_finished_at today",
+        "выборка per variation": "sample_size_per_variation 6451",
+        "плановая дата остановки": "planned_stop 2026-10-15",
+        "дата код-фриза": "code_freeze 2026-09-24",
+    }
+    shown = False
+    for t in tests:
+        gaps = missing(t)
+        if not gaps:
+            continue
+        shown = True
+        print(c(f"\n{t['id']}", BOLD) + f"  {STAGE_RU.get(t.get('stage'), '')}")
+        for g in gaps:
+            hint = next((v for k, v in hints.items() if k in g), None)
+            if hint:
+                print(f"  · {g}")
+                print("    " + c(f"ab set {t['id']} {hint}", CYN))
+            else:
+                print(f"  · {g}")
+    if not shown:
+        print(c("\n  Всё закрыто.", GRN))
+    print(c("\n  Не знаешь значение — спроси агента: /ab-recheck <ключ>\n", DIM))
+
+
+OWNERS = CFG.get("field_owners") or {}
+
+
+def owner_of(field):
+    top = field.split(".")[0]
+    for role, fields in OWNERS.items():
+        if top in fields:
+            return role
+    return None
+
+
+def cmd_info(args):
+    """Всё о тесте одной командой. ab info <id> [--json]"""
+    if not args:
+        print("ab info <id> [--json]"); return 1
+    tid = args[0]
+    f = TESTS / f"{tid}.md"
+    if not f.exists():
+        print(c(f"Нет теста {tid}", RED)); return 1
+    raw = f.read_text(encoding="utf-8")
+    d = yaml.safe_load(raw.split("---", 2)[1]) or {}
+    if product_of(d) not in my_products():
+        pm = CFG.get("product_map", {})
+        print(c(f"  {tid} — тест продукта «{pm.get(product_of(d), {}).get('name', product_of(d))}», "
+                f"а у тебя настроен «{', '.join(pm.get(x, {}).get('name', x) for x in my_products())}».", YEL))
+        print(c("  Изменить: ab config products vpn,adblocker", DIM)); return 1
+    if "--json" in args:
+        import json
+        print(json.dumps(d, ensure_ascii=False, default=str, indent=1)); return 0
+    st = d.get("stage", "incoming")
+    print(c(f"\n{tid}", BOLD) + f"  {d.get('title','')}")
+    print(f"  {STAGE_RU.get(st, st)} · {d.get('platform','?')} · {d.get('slot') or 'слот не назначен'}")
+    print(f"  experiment_name: {d.get('experiment_name') or c('—', RED)}")
+    v = d.get("variants") or {}
+    if isinstance(v, dict) and v:
+        print("  ветки: " + " · ".join(f"{k}: {str(x)[:40]}" for k, x in v.items()))
+    t = d.get("tasks") or {}
+    print("  задачи: " + " · ".join(f"{k}={t.get(k) or '—'}" for k in
+          ("design", "dev", "backend", "cleanup", "backend_close")))
+    for k in ("research_card", "fix_version", "started_at", "decision", "decision_at",
+              "backend_finished_at", "code_removed_version"):
+        if d.get(k): print(f"  {k}: {d[k]}")
+    m = missing(d)
+    print(c(f"  гейт: {'закрыт' if not m else 'не закрыто ' + str(len(m))}", GRN if not m else YEL))
+    for g in m[:5]: print(f"    · {g}")
+    if d.get("synced_at") or d.get("checked_at"):
+        print(c(f"  sync: {d.get('synced_at') or '—'} · check: {d.get('checked_at') or '—'}", DIM))
+    if d.get("notes"): print(c(f"  notes: {str(d['notes'])[:160]}", DIM))
+    print()
+    return 0
+
+
+def cmd_fact(args):
+    """Безопасная запись в FACTS.md: заменяет одну секцию, остальное не трогает.
+       ab fact get <заголовок>  |  ab fact set <заголовок> <текст>  |  ab fact list"""
+    f = ROOT / "FACTS.md"
+    txt = f.read_text(encoding="utf-8") if f.exists() else "# Справочник окружения\n"
+    import re
+    secs = re.split(r"(?m)^(?=## )", txt)
+    head, body = secs[0], secs[1:]
+    titles = [b.splitlines()[0][3:].strip() for b in body]
+    if not args or args[0] == "list":
+        for t in titles: print("  ·", t)
+        return 0
+    op = args[0]
+    if op == "get" and len(args) >= 2:
+        want = " ".join(args[1:]).lower()
+        for t, b in zip(titles, body):
+            if want in t.lower():
+                print(b.rstrip()); return 0
+        print(c("секции нет", RED)); return 1
+    if op == "set" and len(args) >= 3:
+        title, text = args[1], " ".join(args[2:]).replace("\\n", "\n")
+        new_sec = f"## {title}\n\n{text.strip()}\n\n"
+        for i, t in enumerate(titles):
+            if t.lower() == title.lower():
+                body[i] = new_sec; break
+        else:
+            # вставить перед журналом, если он есть
+            idx = next((i for i, t in enumerate(titles) if t.startswith("Журнал")), len(body))
+            body.insert(idx, new_sec)
+        f.write_text(head + "".join(body), encoding="utf-8")
+        print(c(f"  секция «{title}» записана", GRN)); return 0
+    print("ab fact list | get <заголовок> | set <заголовок> <текст>"); return 1
+
+
+def cmd_doctor(args):
+    """Проверка окружения: что есть, чего нет, что сделать. ab doctor [--json]"""
+    import json, os, ssl, urllib.request, urllib.error
+    checks = []   # (id, ok, title, detail, fix)
+
+    def add(cid, ok, title, detail="", fix=""):
+        checks.append((cid, ok, title, detail, fix))
+
+    # ── 1. python и зависимости ──
+    try:
+        import certifi; add("python", True, "Python и certifi", f"certifi {certifi.__version__}")
+    except Exception:
+        add("python", False, "Python и certifi", "certifi не установлен",
+            "python3 -m pip install --user certifi")
+
+    # ── 2. config: pm ──
+    pm = CFG.get("pm") or {}
+    filled = {k: v for k, v in pm.items() if v and str(v) != "ЗАПОЛНИ"}
+    if {"name", "jira_username"} <= set(filled):
+        add("pm", True, "Кто ты", f"{pm['name']} · {pm['jira_username']}"
+            + ("" if filled.get("notion_user_id") else " · notion_user_id пуст"))
+    else:
+        add("pm", False, "Кто ты", "config.local.yml → pm: не заполнено",
+            "агент Setup спросит имя и логин Jira")
+
+    # ── 3. config: products ──
+    prods = CFG.get("products") or []
+    pmap = CFG.get("product_map") or {}
+    if prods:
+        add("products", True, "Продукты", ", ".join(pmap.get(p, {}).get("name", p) for p in prods))
+    else:
+        add("products", False, "Продукты", "config.local.yml → products: пусто",
+            "агент Setup спросит: VPN, AdBlocker или все")
+
+    # ── 4. product_map заполнен для выбранных ──
+    for p in prods:
+        m = pmap.get(p, {})
+        holes = [k for k, v in m.items() if str(v) == "ЗАПОЛНИ"]
+        if holes:
+            add(f"map_{p}", False, f"Справочник {m.get('name', p)}",
+                "не заполнено: " + ", ".join(holes),
+                "узнать у команды продукта: компонент Product-задач в Jira и значение Product в Research Board")
+        else:
+            add(f"map_{p}", True, f"Справочник {m.get('name', p)}",
+                f"{len(m.get('jira_components', []))} компонентов Jira")
+
+    # ── 5. токен Plausible ──
+    key_file = Path(os.path.expanduser((CFG.get("plausible") or {}).get("key_file") or "~/.plausible-key"))
+    if key_file.exists() and key_file.read_text().strip():
+        add("pl_key", True, "Токен Plausible", str(key_file))
+    else:
+        add("pl_key", False, "Токен Plausible", f"{key_file} нет или пуст",
+            "Plausible → Settings → API keys → создать Stats API key; "
+            f"echo 'ТОКЕН' > {key_file} && chmod 600 {key_file}")
+
+    # ── 6. site_ids для выбранных продуктов ──
+    sites = (CFG.get("plausible") or {}).get("site_ids") or {}
+    plats = CFG.get("platforms") or {}
+    for p in prods:
+        my_plats = [k for k, v in plats.items() if (v.get("product") or "adblocker") == p]
+        known = [k for k in my_plats if sites.get(k) and str(sites[k]) != "ЗАПОЛНИ"]
+        missing_ = [k for k in my_plats if k not in known]
+        name = pmap.get(p, {}).get("name", p)
+        if known and not missing_:
+            add(f"sites_{p}", True, f"Площадки Plausible · {name}", ", ".join(sites[k] for k in known))
+        elif known:
+            add(f"sites_{p}", True, f"Площадки Plausible · {name}",
+                f"есть {len(known)}, нет: {', '.join(missing_)}",
+                "не критично — эти платформы не будут видны в слотах")
+        else:
+            add(f"sites_{p}", False, f"Площадки Plausible · {name}",
+                "ни одной площадки не задано",
+                "узнать site_id у команды продукта или в Plausible → список сайтов; "
+                "вписать в config.yml → plausible.site_ids")
+
+    # ── 7. Plausible отвечает ──
+    base = (CFG.get("plausible") or {}).get("base_url") or ""
+    probe = next((sites[k] for k in sites if sites[k] and str(sites[k]) != "ЗАПОЛНИ"), None)
+    if key_file.exists() and probe and base and base != "ЗАПОЛНИ":
+        try:
+            ctx = ssl.create_default_context()
+            if not ssl.get_default_verify_paths().cafile:
+                import certifi; ctx.load_verify_locations(cafile=certifi.where())
+            req = urllib.request.Request(
+                f"{base}/api/v1/stats/aggregate?site_id={probe}&period=7d&metrics=visitors",
+                headers={"Authorization": f"Bearer {key_file.read_text().strip()}"})
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+                json.loads(r.read())
+            add("pl_net", True, "Plausible отвечает", probe)
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                add("pl_net", False, "Plausible отвечает", "403 — IP не разрешён", "включи VPN и повтори")
+            elif e.code == 401:
+                add("pl_net", False, "Plausible отвечает", "401 — токен не принят", "перевыпусти токен")
+            else:
+                add("pl_net", False, "Plausible отвечает", f"HTTP {e.code}", "проверь base_url в config.yml")
+        except Exception as ex:
+            add("pl_net", False, "Plausible отвечает", str(ex)[:80], "проверь сеть и VPN")
+    else:
+        add("pl_net", False, "Plausible отвечает", "пропущено — нет токена или площадки", "сначала закрой пункты выше")
+
+    # ── 8. MCP: роутер в VS Code ──
+    vs_mcp = Path.home() / "Library/Application Support/Code/User/mcp.json"
+    if vs_mcp.exists() and "mcp-compress-router" in vs_mcp.read_text():
+        add("mcp_vscode", True, "MCP-роутер в VS Code", "прописан глобально")
+    else:
+        add("mcp_vscode", False, "MCP-роутер в VS Code", "не найден в User/mcp.json",
+            "VS Code → ⇧⌘P → MCP: Add Server → stdio → /opt/homebrew/bin/npx -y mcp-compress-router → Global")
+
+    # ── 9. MCP: серверы в роутере ──
+    r_mcp = Path.home() / "Library/Application Support/mcp-compress-router/mcp.json"
+    if r_mcp.exists():
+        try:
+            d = json.loads(r_mcp.read_text())
+            srv = d.get("mcpServers") or d.get("servers") or d
+            have = [k for k in ("aiguard", "notion") if k in srv]
+            miss = [k for k in ("aiguard", "notion") if k not in srv]
+            if not miss:
+                add("mcp_srv", True, "Серверы aiguard и notion", "оба в роутере")
+            else:
+                add("mcp_srv", False, "Серверы aiguard и notion", "нет: " + ", ".join(miss),
+                    "гайд компании «MCP servers»: npx mcp-compress-router add … — нужны твои токены Jira/Bitbucket, "
+                    "для notion — вход через браузер")
+        except Exception:
+            add("mcp_srv", False, "Серверы aiguard и notion", "mcp.json роутера не читается", "проверь файл")
+    else:
+        add("mcp_srv", False, "Серверы aiguard и notion", "роутер не настроен",
+            "гайд компании «MCP servers»: сначала npx mcp-compress-router add …")
+
+    # ── 10. VPN включён (косвенно, по Plausible) ──
+    # уже отражено в pl_net
+
+    # ── 10. база тестов ──
+    import datetime as _dt
+    files = list(TESTS.glob("*.md"))
+    mine = [t for t in load_tests()]
+    reg = ROOT / "NAMES-REGISTRY.md"
+    reg_rows = 0
+    if reg.exists():
+        reg_rows = sum(1 for ln in reg.read_text(encoding="utf-8").splitlines()
+                       if ln.startswith("| AG-") or ln.startswith("| ADG-"))
+    if not files:
+        add("db", False, "База тестов", "tests/ пуста",
+            "агент Setup предложит заполнить из Jira; или /ab-sync в чате")
+    else:
+        newest = max(f.stat().st_mtime for f in files)
+        age = (_dt.date.today() - _dt.date.fromtimestamp(newest)).days
+        det = f"{len(mine)} тестов твоих продуктов, обновлялись {age} дн. назад"
+        if age > 7:
+            add("db", False, "База тестов", det, "устарела — /ab-sync в чате")
+        else:
+            add("db", True, "База тестов", det)
+    if reg_rows:
+        add("registry", True, "Библиотека имён", f"{reg_rows} имён, все продукты")
+    else:
+        add("registry", False, "Библиотека имён", "пуста — проверка уникальности имён не работает",
+            "заполняется тем же /ab-sync")
+
+    # ── вывод ──
+    if "--json" in args:
+        print(json.dumps([dict(id=i, ok=o, title=t, detail=d, fix=f) for i, o, t, d, f in checks],
+                         ensure_ascii=False, indent=1))
+        return 0
+    bad = [x for x in checks if not x[1]]
+    print(c("\n  ПРОВЕРКА ОКРУЖЕНИЯ", BOLD))
+    for cid, ok, title, detail, fix in checks:
+        mark = c("✓", GRN) if ok else c("✗", RED)
+        print(f"  {mark} {title:<34}{c(detail, DIM)}")
+        if not ok and fix:
+            print(f"      {c('→ ' + fix, YEL)}")
+    print()
+    if bad:
+        print(c(f"  Не готово: {len(bad)} из {len(checks)}. Что не может сделать агент — помечено «узнать у…».", YEL))
+    else:
+        print(c("  Всё готово. Можно работать.", GRN))
+    print()
+    return 1 if bad else 0
+
+
+def cmd_config(args):
+    """Записать в config.yml: ab config pm.name "Имя" products vpn,adblocker"""
+    if len(args) < 2 or len(args) % 2:
+        print('ab config <ключ> <значение> [<ключ> <значение> ...]\n'
+              '  ab config pm.name "Имя Фамилия" pm.jira_username i.ivanov\n'
+              '  ab config products vpn,adblocker'); return 1
+    known = list((yaml.safe_load((ROOT / "config.yml").read_text(encoding="utf-8")).get("product_map") or {}).keys())
+    pairs = list(zip(args[0::2], args[1::2]))
+    # личное (pm, products) живёт в config.local.yml и не попадает в git; остальное — в config.yml
+    personal = [(k, v) for k, v in pairs if k == "products" or k.startswith("pm.")]
+    shared = [(k, v) for k, v in pairs if (k, v) not in personal]
+    rc = 0
+    for cf, prs in ((ROOT / "config.local.yml", personal), (ROOT / "config.yml", shared)):
+        if not prs: continue
+        if not cf.exists():
+            cf.write_text(LOCAL_TEMPLATE, encoding="utf-8")
+        rc = _config_write(cf, prs, known) or rc
+    return rc
+
+
+LOCAL_TEMPLATE = """# Личное — этот файл не в git. Общее (продукты, площадки, слоты) — в config.yml.
+pm:
+  name: ЗАПОЛНИ
+  jira_username: ЗАПОЛНИ
+  notion_user_id: ЗАПОЛНИ
+products: []
+"""
+
+
+def _config_write(cf, pairs, known):
+    lines = cf.read_text(encoding="utf-8").splitlines(keepends=True)
+
+    def set_top(key, rendered):
+        for i, ln in enumerate(lines):
+            if ln.startswith(key + ":"):
+                lines[i] = f"{key}: {rendered}\n"; return True
+        return False
+
+    def set_nested(path, rendered):
+        """Путь любой глубины: product_map.vpn.notion_product. Идём по отступам."""
+        parts = path.split(".")
+        depth, sec_indent = 0, -1
+        for i, ln in enumerate(lines):
+            stripped = ln.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(ln) - len(stripped)
+            if depth > 0 and indent <= sec_indent:
+                return False            # вышли из секции, не найдя
+            if stripped.startswith(parts[depth] + ":"):
+                if depth == len(parts) - 1:
+                    comment = ""
+                    if "#" in stripped.split(":", 1)[1]:
+                        comment = "  #" + stripped.split("#", 1)[1].rstrip("\n")
+                    lines[i] = " " * indent + f"{parts[depth]}: {rendered}{comment}\n"
+                    return True
+                depth += 1; sec_indent = indent
+        return False
+
+    for key, val in pairs:
+        if key == "products":
+            items = [v.strip().lower() for v in val.split(",") if v.strip()]
+            bad = [v for v in items if v not in known]
+            if bad:
+                print(c(f"неизвестный продукт: {', '.join(bad)} — есть: {', '.join(known)}", RED)); return 1
+            ok = set_top("products", "[" + ", ".join(items) + "]"); shown = items
+        elif "." in key:
+            rendered = val if (" " not in val and ":" not in val) else f'"{val}"'
+            ok = set_nested(key, rendered); shown = val
+        else:
+            ok = set_top(key, val); shown = val
+        if ok:
+            print(f"  {key} = {c(str(shown), GRN)}")
+        else:
+            print(c(f"  не нашёл {key} в {cf.name} — допиши руками", YEL))
+    cf.write_text("".join(lines), encoding="utf-8")
+    yaml.safe_load(cf.read_text(encoding="utf-8"))   # проверка, что YAML не сломан
+    return 0
+
+
+def cmd_stages(_args):
+    for i, s in enumerate(STAGES):
+        n = len(GATES.get(s, []))
+        print(f"  {i:>2}. {s:<13} {STAGE_RU.get(s, ''):<20} {c(f'{n} пунктов гейта', DIM)}")
+
+
+CMDS = {"board": cmd_board, "check": cmd_check, "week": cmd_week, "new": cmd_new,
+        "set": cmd_set, "fix": cmd_fix, "info": cmd_info, "fact": cmd_fact, "doctor": cmd_doctor, "config": cmd_config,
+        "stages": cmd_stages}
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "board"
+    if cmd not in CMDS:
+        print(f"Команды: {', '.join(CMDS)}"); sys.exit(1)
+    sys.exit(CMDS[cmd](sys.argv[2:]) or 0)

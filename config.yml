@@ -1,0 +1,139 @@
+# Трекер A/B-тестов AdGuard
+# Модель соответствует "A/B test specification": клиент -> /api/v1/session_start
+# -> сервис телеметрии -> внутренний сервис сплит-тестирования -> Plausible.
+
+# Слоты — ТЕХНИЧЕСКИЕ: это custom properties в Plausible, а не организационные лимиты.
+slots: [experiment_1, experiment_2, experiment_3]
+
+# ── Кто работает с трекером. Заполняет агент Setup при первом запуске. ──
+pm:
+  name: ЗАПОЛНИ
+  jira_username: ЗАПОЛНИ
+  notion_user_id: ЗАПОЛНИ
+
+# Какие продукты видит этот пользователь: [adblocker] | [vpn] | [adblocker, vpn]
+products: []   # личное — задаётся в config.local.yml (ab config products ...)
+
+# Как определить продукт теста — по компоненту Jira и площадке Plausible.
+# Реестр имён всегда по всем продуктам, независимо от выбора.
+product_map:
+  adblocker:
+    name: AdBlocker
+    jira_components: ["Android: AdGuard", "Mac: AdGuard Mini", "Mac: AdGuard",
+                      "Windows: AdGuard", "Extensions: AdGuard", "Sciter: Safari App"]
+    jira_product_component: "Product: AdBlocker"
+    notion_product: AdGuard
+  vpn:
+    name: VPN
+    jira_components: ["Windows: VPN", "Mac: VPN", "Extensions: VPN", "Sciter: VPN"]
+    jira_product_component: ЗАПОЛНИ      # аналог Product: AdBlocker
+    notion_product: ЗАПОЛНИ              # значение Product в Research Board
+
+platforms:
+  extension: {name: Extension, cadence: continuous, extra_approver: "Артём (обяз. для расширения)", component: "Extensions: AdGuard"}
+  windows:  {name: Windows, cadence: monthly,    extra_approver: null}
+  macos:    {name: macOS,   cadence: monthly,    extra_approver: null}
+  ios:      {name: iOS,     cadence: store,      extra_approver: null}
+  android:  {name: Android, cadence: store,      extra_approver: null}
+  macmini:  {name: Mac Mini, cadence: 6w,        extra_approver: null, component: "Mac: AdGuard Mini"}  # цикл ~1.5 месяца
+  # VPN — свои платформы: другие компоненты, другие площадки Plausible
+  vpn_windows:   {name: VPN Windows,   cadence: monthly,    extra_approver: null, component: "Windows: VPN",    product: vpn}
+  vpn_macos:     {name: VPN macOS,     cadence: monthly,    extra_approver: null, component: "Mac: VPN",        product: vpn}
+  vpn_extension: {name: VPN Extension, cadence: continuous, extra_approver: null, component: "Extensions: VPN", product: vpn}
+
+warn_before_days:
+  code_freeze: 7
+  planned_stop: 3
+  cleanup: 14        # после решения — сколько дней на закрытие эксперимента
+
+# Стадии = процесс из Research Board (шаги 0-10), разложенный на трекаемые состояния
+stages:
+  - incoming        # 0. Гипотеза в Incoming, ждёт скоринга PM
+  - card            # 1. Оформление карточки теста
+  - design_sync     # 2. Созвон с дизайном: единая трактовка веток
+  - feasibility     # 3. Проверка реализуемости с лидом платформы
+  - scheduling      # 4. На какую версию/патч ставим (PM + проджекты)
+  - development     # 5. Задачи: дизайн -> разработка -> телеметрия
+  - qa              # 6. Сценарии QA переданы и пройдены
+  - running         # 7. Тест идёт в патче/версии
+  - analysis        # 8. Анализ и решение
+  - rollout         # 9. Выкат/откат, убираем код и флаги
+  - closing         # Хвост: finished на бэке + код удалён + слот чистый
+  - closed          # Всё закрыто, слот безопасно переиспользовать
+
+# Правило гигиены слота (из спецификации, раздел "Старые версии приложения"):
+# эксперимент живёт, пока он зашит в коде клиента. Слот безопасен только когда
+# эксперимент finished на бэке И удалён из кода в выпущенной версии.
+
+# Plausible Stats API v1
+plausible:
+  base_url: https://plausible.int.agrd.dev
+  key_file: ~/.plausible-key
+  ca_file: adguard-ca.pem   # корпоративный CA (Python не берёт его из keychain)
+  site_ids:
+    windows: adg.windows.v8.app
+    macos: adg.mac.app
+    android: adg.android.app
+    extension: adg.extension.app
+    ios: ЗАПОЛНИ
+    macmini: adg.macmini.app
+    # VPN — площадки неизвестны, у VPN свои. Узнать у команды VPN или в Plausible.
+    vpn_windows: ЗАПОЛНИ
+    vpn_macos: ЗАПОЛНИ
+    vpn_extension: ЗАПОЛНИ
+
+# ─────────────────────────────────────────────────────────────
+# Владение полями карточки теста. Кто имеет право писать.
+#   pm    — человек или /research-card. Никакая синхронизация не трогает.
+#   jira  — /ab-sync и /ab-check, только из Jira. PM руками не правит.
+#   meta  — служебные, ставит система.
+# `ab set --as jira` откажется писать pm-поле. Это механизм, не просьба.
+field_owners:
+  pm:
+    - title
+    - problem
+    - problem_source
+    - hypothesis
+    - primary_metric
+    - secondary_metric
+    - segment
+    - extrapolation
+    - no_diff_choice
+    - current_conversion
+    - expected_lift
+    - sample_size_per_variation
+    - planned_duration_days
+    - stop_conditions
+    - worst_case
+    - experiment_name
+    - slot
+    - slot_checked
+    - variants
+    - telemetry_events
+    - research_card
+    - notes
+  jira:
+    - stage
+    - tasks
+    - fix_version
+    - target_release
+    - release_version
+    - code_freeze
+    - started_at
+    - stopped_at
+    - decision
+    - decision_at
+    - cleanup_release
+    - backend_finished_at
+    - code_removed_version
+    - code_removed_released_at
+    - design_review_done
+    - qa_passed
+    - conclusion
+  meta:
+    - id
+    - platform
+    - product
+    - created
+    - synced_at
+    - checked_at
