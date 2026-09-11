@@ -7,3 +7,6 @@ __pycache__/
 .DS_Store
 # внутренние черновики
 archive/
+# данные — у каждого свои, заполняет /ab-sync
+tests/*.md
+NAMES-REGISTRY.md

@@ -45,7 +45,7 @@ git clone https://github.com/kpokas-adguard/ab-tests.git ~/ab-tests
 | ---- | --- |
 | `CONTEXT.md` | как всё устроено — единственное, что агент читает при старте |
 | `dashboard.html` | дашборд, пересобирается `bin/ab-dash` |
-| `tests/*.md` | карточки тестов, одна на тест |
+| `tests/*.md` | карточки тестов, одна на тест — заполняет `/ab-sync`, в git не идут |
 | `FACTS.md` | справочник Jira и Notion, агент ведёт сам |
 | `KNOWN-CORRECTIONS.md` | твои поправки агенту — пиши сюда, если он ошибается |
 | `RULES.md` | обязательные правила, коротко |
@@ -63,6 +63,6 @@ git clone https://github.com/kpokas-adguard/ab-tests.git ~/ab-tests
 
 Тесты общие на всю компанию, слоты общие, имена уникальны глобально.
 Если папку копируют несколько продактов — данные в `tests/` разойдутся.
-Репа общая, `tests/` и `NAMES-REGISTRY.md` в ней, личное
-(`config.local.yml`, токен) — у каждого своё и в git не попадает.
-После `/ab-sync` — `git pull`, `git push`, чтобы карточки не разошлись.
+В git — только сам инструмент: агенты, правила, шаблоны, общий `config.yml`.
+Данные (`tests/`, `NAMES-REGISTRY.md`) и личное (`config.local.yml`, токен)
+у каждого свои, заполняются Setup-агентом из Jira и в git не попадают.
