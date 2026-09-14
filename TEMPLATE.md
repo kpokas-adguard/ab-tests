@@ -8,6 +8,7 @@ created: __CREATED__
 stage: incoming
 author:
 research_card:         # ссылка на карточку в Research Board
+prior_art:             # что уже пробовали по теме: ссылка на history/<тема>.md + вывод в 1–2 строки
 
 scored_by_pm:
 incoming_comment:      # что сказали инициатору: берём/нет/когда

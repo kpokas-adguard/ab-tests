@@ -111,6 +111,7 @@ field_owners:
     - variants
     - telemetry_events
     - research_card
+    - prior_art
     - notes
   jira:
     - stage
