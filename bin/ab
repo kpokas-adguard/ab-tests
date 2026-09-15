@@ -534,7 +534,7 @@ def cmd_fact(args):
 
 def cmd_doctor(args):
     """Проверка окружения: что есть, чего нет, что сделать. ab doctor [--json]"""
-    import json, os, ssl, urllib.request, urllib.error
+    import json, os, ssl, urllib.request, urllib.error, datetime as _dt
     checks = []   # (id, ok, title, detail, fix)
 
     def add(cid, ok, title, detail="", fix=""):
