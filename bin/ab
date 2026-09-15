@@ -661,11 +661,33 @@ def cmd_doctor(args):
         add("mcp_srv", False, "Серверы aiguard и notion", "роутер не настроен",
             "гайд компании «MCP servers»: сначала npx mcp-compress-router add …")
 
+    # ── 9б. OAuth-токены роутера (notion, figma) — истекают, нужен повторный login ──
+    cred = r_mcp.parent / "credentials.json"
+    if cred.exists():
+        try:
+            cd = json.loads(cred.read_text())
+            expired = []
+            for name, info in cd.items():
+                exp = ((info or {}).get("tokens") or {}).get("expires_at")
+                if not exp: continue
+                try:
+                    t = _dt.datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+                    if t < _dt.datetime.now(_dt.timezone.utc): expired.append(name)
+                except ValueError:
+                    pass
+            if expired:
+                add("mcp_oauth", False, "Вход в " + ", ".join(expired), "токен истёк — агент скажет «не авторизован»",
+                    "в терминале: " + " ; ".join(f"npx mcp-compress-router@latest login {n}" for n in expired)
+                    + " — откроется браузер; потом в VS Code MCP: List Servers → router → Restart")
+            else:
+                add("mcp_oauth", True, "Вход в notion, figma", "токены действуют")
+        except Exception:
+            pass
+
     # ── 10. VPN включён (косвенно, по Plausible) ──
     # уже отражено в pl_net
 
     # ── 10. база тестов ──
-    import datetime as _dt
     files = list(TESTS.glob("*.md"))
     mine = [t for t in load_tests()]
     reg = ROOT / "NAMES-REGISTRY.md"
