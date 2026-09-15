@@ -33,16 +33,15 @@ experiment_* не отправляется.
    — дефолтный вариант остаётся без изменений, это A/B-тест.
 2. Связать с A/B-системой: поддержать experiment_name и оба version_name.
 3. Замапить эксперимент на слот experiment_3.
-4. Телеметрия: событие на клик по тексту с pageview = home_screen.
+4. Телеметрия: события по PR из раздела «Телеметрия» ниже.
 5. Передавать experiment_* во всех релевантных событиях после assignment.
 
-## Телеметрия для AG-57632-home-screen-protection-level
+## Телеметрия
 
-Часть этой задачи, входит в Definition of Done.
-  - событие: клик по тексту «You're using basic protection. Upgrade to 100%»,
-    pageview = home_screen
-  - experiment_3 = version_name во всех событиях после assignment
-  - проверить в Plausible adg.android.app, что события приходят
+PR с новыми событиями (GitHub): _PM прикрепит_
+
+Часть этой задачи, входит в Definition of Done. Плюс experiment_3 =
+version_name во всех событиях после assignment.
 
 ## Ссылка на PR
 
