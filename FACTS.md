@@ -170,7 +170,7 @@ select/multi_select, типы полей, ID базы релизов, user id.
 | Свойство | Тип | Значения / формат |
 | -------- | --- | ----------------- |
 | Name | title | `<ключ продуктовой задачи>. <Название>` |
-| Type | multi_select | `A/B`, _остальные — заполнить_ |
+| Type | multi_select | `Preference test`, `10-sec test`, `Survey`, `A/B`, `Research`, `Usability test`, `CustDev`, `Analytics` (проверено 2026-09-16, скрин) |
 | Research Area | multi_select | `Activation`, `Revenue`, _остальные — заполнить_ |
 | Product | multi_select | `AdGuard`, _остальные — заполнить_ |
 | Platform | multi_select | `Mini`, `Mac`, `Android`, `Windows`, `iOS`, `Extension` — _уточнить_ |
